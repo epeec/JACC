@@ -1,0 +1,47 @@
+##      This file is part of JACC and is licenced under terms contained in the COPYING file
+##
+##      Copyright (C) 2021 Barcelona Supercomputing Center (BSC)
+
+#!/bin/bash
+
+set -e
+
+CC=pgcc
+
+if [[ -z "$1" ]] || [[ ! -f "$1" ]] ; then
+    echo "Usage: $0 c-file" >&2
+    exit 1
+fi
+
+TEMP_DIR=$(mktemp -d)
+C_FILE="${TEMP_DIR}/tmp.c"
+HEADER="$(dirname $0)/jacc.h"
+
+{
+    # Variables to bypass restrictions of Omni Compiler
+    echo 'static int __jacc_serial__;';
+
+    echo "# 1 \"$HEADER\"";
+    cat $HEADER;
+    echo "# 1 \"$1\""
+    cat $1 | sed -e '
+s/#pragma\s\+acc\s\+wait.*$/__jacc_wait();/g;
+s/\(#pragma\s\+acc\s\+\)serial\(.*\)$/\1 parallel \2 if (__jacc_serial__)/g;
+s/acc_create/__j\0/g;
+s/acc_copyin/__j\0/g;
+s/acc_copyout/__j\0/g;
+s/acc_delete/__j\0/g;
+s/acc_update_self/__j\0/g;
+s/acc_update_device/__j\0/g;
+s/acc_malloc/__j\0/g;
+s/acc_free/__j\0/g;
+s/acc_init/__jacc_\0/g;
+s/acc_shutdown/__jacc_\0/g;';
+} > $C_FILE
+
+${CC} -E -D_OPENACC -I$(dirname $1) $C_FILE |
+ C_Front -facc -fopenmp |
+ cat -v | sed -e 's/^\(<XcodeProgram .*\) time=.*$/\1/g' | # To bypass a Omni Compiler's bug
+ grep -av '<linemarker lineno=' > "$(basename $1 .c).xml"
+
+rm -rf ${TEMP_DIR}
