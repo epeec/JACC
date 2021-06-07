@@ -1,6 +1,8 @@
-# jacc
+# JACC
 
-An OpenACC transpiler which enables JIT compilation with dynamic trace.
+Is an OpenACC transpiler which enables JIT compilation with dynamic trace.
+
+Developed by Kazuaki Matsumura from the Accelerators and Communications for High Performance Computing team at BSC
 
 ## Requirements
 * Gauche (>= 0.9.8)
