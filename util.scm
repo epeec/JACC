@@ -1,7 +1,3 @@
-;;      This file is part of JACC and is licenced under terms contained in the COPYING file
-;;
-;;      Copyright (C) 2021 Barcelona Supercomputing Center (BSC)
-
 (define-module util
   (use util.match)
   (use sxml.tools)
@@ -9,6 +5,7 @@
   (use srfi-1)
   (use srfi-14)
   (use srfi-27)
+  (use gauche.sequence)
   (export
    ccc-sxpath
    if-ccc-sxpath
@@ -26,6 +23,7 @@
    match1
    match-lambda1
    values-map
+   find-index-tail
    ))
 (select-module util)
 
@@ -128,3 +126,8 @@
                 [ccc (if-car cc)])
        ccc))
    path))
+
+(define (find-index-tail pred seq)
+  (let* ([mi (map-with-index (^[i x] (if (pred x) i -1)) seq)]
+         [m  (apply max mi)])
+    (if (>= m 0) m #f)))

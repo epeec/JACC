@@ -1,7 +1,3 @@
-//      This file is part of JACC and is licenced under terms contained in the COPYING file
-//      
-//      Copyright (C) 2021 Barcelona Supercomputing Center (BSC)
-
 #ifndef _JACC_H
 #define _JACC_H
 
@@ -32,19 +28,34 @@ typedef struct __JaccArg {
     // array address for arrays and variable address for variables
     void *addr;
 
+    // Storage size (different from the C implementation)
     size_t size;
 
     // array | static | present | reducted | dist | written | read
     int attr;
 
+    int dimnum;
+
+    int *lbound;
+
+    int *ubound;
+
+    int splitdim;
+
     size_t split_dimsize;
 
     size_t memdepth;
 
+    size_t elmsize;
+
     struct __JaccArg *next;
 } __JaccArg;
 
-void __jacc_kernel_push(const char *code, __JaccArg *arg);
+void __jacc_arg_build(const char *type, const char *symbol, void *addr,
+                      size_t size, int attr, int dimnum, int splitdim,
+                      size_t *lbound, size_t *ubound, __JaccArg **next);
+
+void __jacc_kernel_push(const char *code, __JaccArg **arg);
 
 void __jacc_copyin(void *a, size_t len);
 
@@ -73,5 +84,7 @@ void __jacc_acc_init(acc_device_t devicetype);
 void __jacc_acc_shutdown(acc_device_t devicetype);
 
 void __jacc_optimize();
+
+double jacc_time();
 
 #endif

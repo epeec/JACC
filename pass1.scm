@@ -1,7 +1,3 @@
-;;      This file is part of JACC and is licenced under terms contained in the COPYING file
-;;
-;;      Copyright (C) 2021 Barcelona Supercomputing Center (BSC)
-
 (define-module pass1
   (use util)
   (use xm)
@@ -35,9 +31,7 @@
   (sxml:attr
    decl
    (case (sxml:name decl)
-     [(pointerType) 'ref]
-     [(arrayType)   'element_type]
-     [(basicType)   'name])))
+     [(FbasicType) 'ref])))
 
 (define (search-element-type ht type)
   (or (and-let* ([type]
@@ -49,12 +43,14 @@
 (define (search-array-size ht type)
   (and-let* ([type] [decl (ref ht type #f)])
     (let1 inner (search-array-size ht (fetch-element-type decl))
-      (if (eq? (sxml:name decl) 'arrayType)
-          (and-let1 s (sxml:attr decl 'array_size)
-            (cons (if-let1 n (string->number s)
-                    (gen-int-expr n)
-                    (sxml:car-content (sxml:car-content decl)))
-                  (or inner '())))
+      (if-let1 ir (and 
+                   (not (sxml:attr decl 'is_allocatable))
+                   ((if-sxpath "indexRange") decl))
+          (map
+           (^[x]
+             (let1 up (~ (extract-index-range x) 1)
+                   up))
+           ir)
 
           inner
           ))))
@@ -149,15 +145,21 @@
            (insert-data-info-acc-data! type-ht env s))
          (when (>= (length c) 3) (rec! env (~ c 2))))]
 
-      [(functionDefinition compoundStatement)
+      [(FfunctionDefinition blockStatement)
        (let1 env (update-env env ((car-sxpath "symbols") s))
          (rec-multi! env ((content-car-sxpath "body") s)))]
 
-      [(doStatement whileStatement forStatement switchStatement)
+      [(FmoduleDefinition)
+       (let1 env (update-env env ((car-sxpath "symbols") s))
+         (when ((if-sxpath "FcontainsStatement") s)
+           (rec-multi! env ((content-car-sxpath "FcontainsStatement") s))))]
+
+      [(FdoStatement FdoWhileStatement
+        FcaseLabel forallStatement FdoConcurrentStatement then else)
        (rec-multi! env ((content-car-sxpath "body") s))]
 
-      [(ifStatement)
-       (rec-multi! env (map cadr (sxml:content s)))]
+      [(FifStatement FcontainsStatement list)
+       (rec-multi! env (sxml:content s))]
       ))
 
   (rec! env state))
@@ -205,12 +207,16 @@
        (when (>= (length cnt) 3)
          (insert-*! name vars (~ cnt 2))))]
 
-    [(functionDefinition compoundStatement
-      doStatement whileStatement forStatement switchStatement)
+    [(FfunctionDefinition FdoStatement FdoWhileStatement blockStatement
+      FcaseLabel forallStatement FdoConcurrentStatement then else)
      (insert-*-multi! vars ((content-car-sxpath "body") state))]
 
-    [(ifStatement)
-     (insert-*-multi! vars (map cadr (sxml:content state)))]
+    [(FmoduleDefinition)
+     (when ((if-sxpath "FcontainsStatement") state)
+       (insert-*-multi! vars ((content-car-sxpath "FcontainsStatement") state)))]
+
+    [(FifStatement FcontainsStatement list)
+     (insert-*-multi! vars (sxml:content state))]
     ))
 
 (define (insert-present! vars state) (insert-*! "PRESENT" vars state))
@@ -220,9 +226,9 @@
   (rlet1 xm (xm-copy xm)
     (let ([type-ht (create-type-ht xm)]
           [env     (extract-global-env xm)]
-          [defs    ((sxpath "functionDefinition")
+          [defs    ((sxpath '((or@ FfunctionDefinition FmoduleDefinition)))
                     (xm-global-declarations xm))])
-      (for-each (cut insert-data-info! type-ht env <>) defs)
+      #;(for-each (cut insert-data-info! type-ht env <>) defs)
       (for-each (cut insert-present!   '() <>)         defs)
       (for-each (cut insert-deviceptr! '() <>)         defs)
       )))

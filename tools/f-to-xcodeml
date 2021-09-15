@@ -1,0 +1,13 @@
+#!/bin/bash
+
+set -e
+
+FC=pgf90
+
+if [[ -z "$1" ]] || [[ ! -f "$1" ]] ; then
+    echo "Usage: $0 f-file" >&2
+    exit 1
+fi
+
+${FC} -E -DSPEC -D_OPENACC -D_singlePU -D_REVISION_="1" $1 |
+  sed 's/ async(.*)//g' | F_Front -facc > "$1.xml"

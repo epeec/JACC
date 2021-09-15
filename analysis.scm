@@ -1,7 +1,3 @@
-;; 	This file is part of JACC and is licenced under terms contained in the COPYING file
-;;	
-;;	Copyright (C) 2021 Barcelona Supercomputing Center (BSC)
-
 (define-module analysis
   (use util)
   (use xm)
@@ -20,11 +16,20 @@
    locate-split-dimention
    extract-dependency
    extract-conflict
+   extract-index-flow
+   flatten-index-flow
+   similar-address?
+   access-equal?
+   expr-equal?
+   set-sequential-iterator!
+   construct-env-dependency
    mark-duplicated-statement!
    sort-expr
    add-tag
    revert-tag
    remove-tag
+   select-array-index
+   extract-varref-name
    ))
 (select-module analysis)
 
@@ -37,7 +42,8 @@
           [(eq? (sxml:name (car content) ) 'ACCPragma)
            (loop (cdr content) (cons (car content) acc))]
 
-          [(null? ((sxpath '(// (or@ arrayRef pointerRef))) (car content)))
+          ;; No reference just under parallel/loop construct
+          [(null? ((sxpath '(// FarrayRef)) (car content)))
            (loop (cdr content) acc)]
 
           [else #f])))
@@ -47,25 +53,36 @@
 
         [(eq? (sxml:name state) 'ACCPragma)
          (match-let1 (('string dirname) _ body) (sxml:content state)
-           (let1 name (sxml:name body)
+           (let* ([body (if (and (eq? (sxml:name body) 'list)
+                                 (= (length (sxml:content body)) 1))
+                            ;; remove unncessary <list>
+                            (sxml:car-content body) body)]
+                  [name (sxml:name body)])
              (cond [(eq? name 'ACCPragma)
                     (extract-innermost-parallel-region body)]
 
-                   [(eq? name 'forStatement)
-                    (let* ([compound ((car-sxpath "body/compoundStatement") body)]
-                           [content ((content-car-sxpath "body") compound)])
+                   [(eq? name 'FdoStatement)
+                    (let1 content ((content-car-sxpath "body") body)
                       (if (not (= (length content) 1))
                           (extract-innermost-parallel-region
-                           (or (extract-parallel-content content) compound))
+                           (or (extract-parallel-content content) body))
                           (extract-innermost-parallel-region (car content))))]
 
-                   [(eq? name 'compoundStatement)
+                   [(eq? name 'blockStatement)
                     (let1 content ((content-car-sxpath "body") body)
                       (if (not (= (length content) 1)) body
                           (extract-innermost-parallel-region (car content))))]
 
                    [else body]
                    )))]
+
+        [(eq? (sxml:name state) 'FdoStatement)
+         (let1 content ((content-car-sxpath "body") state)
+            (cond [(not (sxml:attr state 'jacc_loop)) state]
+
+                  [(not (= (length content) 1)) (cons 'body content)]
+
+                  [else (extract-innermost-parallel-region (car content))]))]
 
         [else state]))
 
@@ -115,7 +132,7 @@
        (cons
         (car ps)
         (let1 m (apply max (cdr ps))
-          (find-index (cut = m <>) (cdr ps)))))
+          (find-index-tail (cut = m <>) (cdr ps)))))
      parallelism-sum)
     ))
 
@@ -129,6 +146,7 @@
    (match-let1 (y1 y2) (sxml:content y)
      (and (expr-equal? x y1)
           (or (not (eq? (sxml:name x) 'Var))
+              ;; sequential iterators
               (not (member (sxml:car-content x) ITERATORS)))
           (eq? (car y2) 'intConstant)
           (and
@@ -224,8 +242,7 @@
                     [writes (append writes (assoc-ref env access '() access-equal?))]
                     [writes (delete-duplicates writes state-equal?)])
                (loop (cdr flow)
-                     (if (null? writes) env
-                         (acons access writes (alist-delete! access env)))))]
+                     (acons access writes (alist-delete! access env))))]
 
             [(write)
              ;; w[*]->w[*]
@@ -258,12 +275,14 @@
                     [reads (dig-all-reads rv env)]
                     [reads (delete-duplicates reads state-equal?)])
                (loop (cdr flow)
-                     (if (null? reads) env
-                         (acons access reads (alist-delete! access env)))))]
+                     (acons access reads (alist-delete! access env))))]
 
             [(read) (loop (cdr flow) env)]
 
             )))))
+
+(define (set-sequential-iterator! iter)
+  (set! ITERATORS iter))
 
 ;; '((read -> write) ...)          (write could be variable. read be a array)
 ;; i.e. => { x = a[i]; b[i] = x; } (write-b needs read-a)
@@ -313,12 +332,14 @@
 (define (extract-index-flow state)
   (construct-index-flow state))
 
-(define (flatten-index-flow index-flow :optional (existential-quantifier #f))
-  (define (rec flow) (flatten-index-flow flow existential-quantifier))
-  (case (car index-flow)
+(define (flatten-index-flow index-flow :optional (existential-quantifier #f) (no-loop #f))
+  (define (rec flow) (flatten-index-flow flow existential-quantifier no-loop))
+  (case (and (pair? index-flow) (car index-flow))
     [(loop)
-     (let* ([body (append-map rec (cddr index-flow))]
-            [body (append body body)])
+     (let* ([body (append-map
+                   (cut flatten-index-flow <> existential-quantifier #t)
+                   (cddr index-flow))]
+            [body (if no-loop body (append body body))])
        (if existential-quantifier
            (let1 iterators (cadr index-flow)
              (append (map (cut list 'def <>) iterators)
@@ -358,7 +379,7 @@
 
          [rflow (reverse index-flow)]
 
-         ;; Add variables in index of write address
+         ;; Add variables in index of write address to the list for duplication
          ;; FIXME: Keep least statements duplicated
          ;;        by creating the read-in-index->write relation
          ;;        (conflicts and dependencies have relations from writes,
@@ -402,14 +423,19 @@
       (when expr
         (sxml:add-attr! expr '(jacc_dup "1"))))
 
-    ;; updated contains updated variables which cannot not be referred anymore
+    ;; `updated` contains updated variables which cannot be referred anymore
+    ;;
+    ;;     tmp = (x <= ub && x >= lb) ? a[k] : 0; // this x is invalid (x is updated in the reversed order)
+    ;;     x = 1
+    ;;     (x <= ub && x >= lb) ? b[x] = 0 : 0;
+    ;;
     (let loop ([rflow rflow] [iterators '()] [updated '()])
 
       (unless (null? rflow)
         (let1 head (car rflow)
           (case (car head)
             [(def)
-             ;; TODO: x[i]=x[i-1] in loop
+             ;; OLD TODO: x[i]=x[i-1] in loop => this causes no problem if i is parallel
              (loop (cdr rflow)
                    (delete (cadr head) iterators equal?)
                    (cons (cadr head) updated))]
@@ -480,6 +506,15 @@
   ;; faster version
   (substring varname 0 (string-scan varname "__tag__")))
 
+(define (select-array-index name)
+  (lambda (x)
+    (if (pair? (sxml:content x))
+        (sxml:car-content x)
+        `(Var ,name))))
+
+(define (extract-varref-name varref)
+  (sxml:car-content (sxml:car-content varref)))
+
 ;;;
 ;;; Construct the flow index '(loop (loop (write i j k) ...) (loop ...))
 ;;;
@@ -491,7 +526,7 @@
     [(ACCPragma)
      (construct-index-flow (~ (sxml:content state) 2))]
 
-    [(compoundStatement)
+    [(blockStatement)
      (append
       (append-map
        (match-lambda
@@ -501,20 +536,28 @@
        ((sxpath "declarations/varDecl") state))
       (append-map construct-index-flow ((content-car-sxpath "body") state)))]
 
-    [(forStatement)
-     (let1 pred (append-map
-                 construct-index-flow
-                 (append ((content-car-sxpath "init") state)
-                         ((content-car-sxpath "condition") state)
-                         ((content-car-sxpath "iter") state)))
+    [(FdoStatement)
+     (let1 pred (construct-index-flow ((car-sxpath "indexRange") state))
        `((loop
-          ,((sxpath `(init assignExpr (* 1) ,(sxpath:name 'Var) *text*)) state)
+          ,((sxpath `(Var *text*)) state)
           ,@pred
           (cond
            (,@pred)
-           ,@(construct-index-flow ((car-sxpath "body/compoundStatement") state))))))]
+           ,@(append-map construct-index-flow ((content-car-sxpath "body") state))
+           ))))]
 
-    [(doStatement whileStatement)
+    [(indexRange)
+     (append-map
+      construct-index-flow
+      (append
+       ((content-car-sxpath "lowerBound") state)
+       ((content-car-sxpath "upperBound") state)
+       ((content-car-sxpath "step") state)))]
+
+    [(value)
+     (construct-index-flow ((sxml:content state)))]
+
+    [(FdoWhileStatement)
      `((loop
         ()
        ,@(append-map
@@ -522,104 +565,81 @@
           (append ((content-car-sxpath "condition") state)
                   ((content-car-sxpath "body")      state)))))]
 
-    [(switchStatement)
+    [(FselectCaseStatement)
      (append
       (construct-index-flow ((content-car-sxpath "value") state))
-      (construct-index-flow ((content-car-sxpath "body")  state)))]
+      (append-map construct-index-flow ((sxpath "FcaseLabel") state)))]
 
-    [(ifStatement)
+    [(FcaseLabel)
+     (append-map
+      construct-index-flow
+      (append
+       ((sxpath "value") state)
+       ((sxpath "indexRange") state)
+       ((content-car-sxpath "body"))))]
+
+    [(FifStatement)
      (let1 c (map cadr (sxml:content state))
        `((cond
           ( ,@(construct-index-flow (car c)) )
           ,@(append-map construct-index-flow (cdr c)))))]
 
-    [(exprStatement castExpr)
+    [(then else body list)
+     (append-map construct-index-flow (sxml:content state))]
+
+    [(exprStatement)
      (construct-index-flow (sxml:car-content state))]
 
     [(functionCall)
      (append-map construct-index-flow
                  ((content-car-sxpath "arguments") state))]
 
-    ;; FIXME: Convert asg* before pass2 to be rewritten as assignExpr
-    [(asgPlusExpr asgMinusExpr asgMulExpr asgDivExpr
-      asgModExpr asgLshiftExpr asgRshiftExpr asgBitAndExpr
-      asgBitOrExpr asgBitXorExpr)
-     (match-let1 (var val) (sxml:content state)
-       (construct-index-flow (gen-=-expr var (list 'plusExpr var val))))]
-
-    [(assignExpr)
+    [(FassignStatement)
      (match-let* ([(lv rv) (sxml:content state)]
                   [rv-flow (construct-index-flow rv)])
        (append
 
         (case (sxml:name lv)
-          [(Var) (append rv-flow `((write #f ,(add-tag (sxml:car-content lv) lv) ,rv-flow)))]
+          [(Var)
+           (append rv-flow
+                   `((write #f ,(add-tag (sxml:car-content lv) lv) ,rv-flow)))]
 
           [(Var memberRef) '()]
 
-          [(arrayRef)
-           (let1 c (sxml:content lv)
+          [(FarrayRef)
+           (let* ([c (sxml:content lv)] [name (extract-varref-name (car c))])
              (append
-              ;(append-map construct-index-flow (cdr c))
+              #;(append-map construct-index-flow (cdr c))
 
               `((write ,state
-                 ,(add-tag (sxml:car-content (car c)) lv)
-                 ,@(map sort-expr (cdr c))
-                 ,rv-flow
+                 ,(add-tag name lv)
+                 ,@(map (.$ sort-expr (select-array-index name)) (cdr c))
+                 ,rv-flow ; no need to add index-flow of lv's indices, which are duplicated
                  ))))]
-
-          [(pointerRef)
-           (let1 c (sxml:car-content lv)
-             (cond [(and (eq? (sxml:name c) 'plusExpr)
-                         (eq? (sxml:name (sxml:car-content c)) 'Var))
-                    (let1 index (cadr (sxml:content c))
-                      (append
-                       ;(construct-index-flow index)
-                       `((write ,state
-                          ,(add-tag (sxml:car-content (sxml:car-content c)) lv)
-                          ,(sort-expr index)
-                          ,rv-flow ))))]
-
-                   [else rv-flow]))]
           )))]
 
-    [(arrayRef)
-     (let1 c (sxml:content state)
+    [(FarrayRef)
+     (let* ([c (sxml:content state)] [name (extract-varref-name (car c))])
        (append
-        (append-map construct-index-flow (cdr c))
+        (append-map (.$ construct-index-flow (select-array-index name)) (cdr c))
 
         `((read ,state
-           ,(%add-tag (sxml:car-content (car c)))
-           ,@(map sort-expr (cdr c))))))]
+           ,(%add-tag name)
+           ,@(map (.$ sort-expr (select-array-index name)) (cdr c))))))]
 
-    [(pointerRef)
-     (let1 c (sxml:car-content state)
-       (cond [(and (eq? (sxml:name c) 'plusExpr)
-                   (eq? (sxml:name (sxml:car-content c)) 'Var))
-              (let1 index (cadr (sxml:content c))
-                (append
-                 (construct-index-flow index)
-                 `((read ,state
-                    ,(%add-tag (sxml:car-content (sxml:car-content c)))
-                    ,(sort-expr index)))))]
-
-             [else '()]))]
-
-    [(plusExpr minusExpr mulExpr divExpr condExpr
+    [(plusExpr minusExpr mulExpr divExpr FpowerExpr FconcatExpr
       modExpr LshiftExpr RshiftExpr bitAndExpr bitOrExpr bitXorExpr
       logEQExpr logNEQExpr logGEExpr logGTExpr logLEExpr logLTExpr
-      logAndExpr logOrExpr
-      postIncrExpr postDecrExpr preIncrExpr preDecrExpr
-      unaryMinusExpr bitNotExpr logNotExpr sizeOfExpr
-      commaExpr commaExpr0 memberRef)
+      logAndExpr logOrExpr logEQVExpr logNEQVExpr unaryMinusExpr logNotExpr
+      lowerBound upperBound step)
      (append-map construct-index-flow (sxml:content state))]
 
-    [(Var varAddr)
+    [(Var varRef)
      `((read #f ,(%add-tag (sxml:car-content state) )))]
 
-    [(caseLabel defaultLabel breakStatement continueStatement
-      intConstant longlongConstant floatConstant
-      stringConstant moeConstant funcAddr arrayAddr)
+    [(FintConstant FrealConstant FcharacterConstant
+      FlogicalConstant FcomplexConstant namedValue FcycleStatement FexitStatement
+      varRef FarrayRef FcharacterRef statementLabel continueStatement)
      '()]
 
     [else (error #"Unknown statement: ~(sxml:name state)")]
@@ -629,30 +649,13 @@
   (if (not (sxml:element? expr)) expr
       (let1 c (sxml:content expr)
         (case (sxml:name expr)
-          [(assignExpr)
-           (sort-expr (~ c 1))]
-
-          [(postIncrExpr postDecrExpr commaExpr0)
-           (sort-expr (~ c 0))]
-
-          [(commaExpr)
-           (sort-expr (last c))]
-
-          [(preIncrExpr preDecrExpr)
-           `(,(if (eq? (sxml:name expr) preIncrExpr) plusExpr minusExpr)
-             ,@(sort (list (sort-expr (~ c 0)) (gen-int-expr 1))))]
-
-          [(castExpr functionCall condExpr minusExpr divExpr
-            modExpr LshiftExpr RshiftExpr bitAndExpr bitOrExpr bitXorExpr
-            logEQExpr logNEQExpr logGEExpr logGTExpr logLEExpr logLTExpr
-            logAndExpr logOrExpr unaryMinusExpr bitNotExpr logNotExpr
-            sizeOfExpr commaExpr commaExpr0 arrayRef pointerRef)
+          [(minusExpr divExpr FpowerExpr FconcatExpr logEQExpr
+            logNEQExpr logGEExpr logGTExpr logLEExpr logLTExpr logAndExpr
+            logOrExpr logEQVExpr logNEQVExpr unaryMinusExpr logNotExpr)
            (sxml:change-content expr (map sort-expr c))]
 
           [(plusExpr mulExpr)
            (sxml:change-content expr (sort (map sort-expr c)))]
-
-          [(moeConstant) expr]
 
           [else (sxml:snip expr)]
           ))))

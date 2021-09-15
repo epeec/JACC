@@ -1,0 +1,21 @@
+#!/bin/bash
+
+set -e
+
+if [[ -z "$1" ]] || [[ ! -f "$1" ]] ; then
+    echo "Usage: $0 xcodeml-file [-s]" >&2
+    exit 1
+fi
+
+OUTPUT="$(basename $1 .xml).f90"
+
+F_Back < $1 |
+  # sed -e 's/\\n/\0"\/\/\&\n\&"/g' | # PGI doesn't support too much long strings
+  cat > $OUTPUT
+
+if [ "$2" = "-s" ]; then
+    cat $OUTPUT |
+        # sed -e 's/\.or\./\0\n/g' | # PGI doesn't support too much long strings
+        sed -n '/<JACC>/,/<\/JACC>/p' | sed '1d;$d'
+    rm $OUTPUT
+fi

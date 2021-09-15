@@ -1,7 +1,3 @@
-;;      This file is part of JACC and is licenced under terms contained in the COPYING file
-;;
-;;      Copyright (C) 2021 Barcelona Supercomputing Center (BSC)
-
 (define-module xm
   (use sxml.tools)
   (use sxml.sxpath)
@@ -22,10 +18,12 @@
    xm->sxml
    xm-copy
 
+   extract-arrayref
+   extract-index-range
    extract-loop-counters
 
-   gen-compound
-   gen-compound-with-local-vars
+   gen-block
+   gen-block-with-local-vars
    gen-=-expr
    gen-var=-expr
    gen-var=int-expr
@@ -96,15 +94,15 @@
          (xm-global-declarations xm))
    (xm-attributes xm)))
 
-(define (gen-compound . states)
-  `(compoundStatement
+(define (gen-block . states)
+  `(blockStatement
     (symbols)
     (declarations)
     (body
      ,@states)))
 
 ;; lvar ::= '(type name) | '(type name value)
-(define (gen-compound-with-local-vars local-vars . states)
+(define (gen-block-with-local-vars local-vars . states)
   (define (gen-id type name sclass)
     `(id (@ (type ,type) (sclass ,sclass)) (name ,name)))
 
@@ -134,7 +132,7 @@
 
   (let-values ([(ids decls) (values-map local-var->id&decl local-vars)])
     `
-    (compoundStatement
+    (blockStatement
      (symbols ,@ids)
      (declarations ,@decls)
      (body ,@states))
@@ -146,7 +144,7 @@
      (define (name l r)
        (list label l r))]))
 
-(define-binop-expr gen-=-expr 'assignExpr)
+(define-binop-expr gen-=-expr 'FassignStatement)
 
 (define (gen-var=-expr varname rvalue)
   (gen-=-expr `(Var ,varname) rvalue))
@@ -158,21 +156,21 @@
   (syntax-rules ()
     [(_ name gen-expr)
      (define (name l r)
-       `(exprStatement ,(gen-expr l r)))]))
+       (gen-expr l r))]))
 
 (define-binop-state gen-=       gen-=-expr)
 (define-binop-state gen-var=    gen-var=-expr)
 (define-binop-state gen-var=int gen-var=int-expr)
 
-(define (gen-funcall fun-name . args)
+(define (gen-funcall fun-name :optional (type "Fvoid") :rest args)
   `(exprStatement
-    ,(apply gen-funcall-expr fun-name args)))
+    ,(apply gen-funcall-expr fun-name type args)))
 
-(define (gen-funcall-expr fun-name . args)
+(define (gen-funcall-expr fun-name :optional (type "Fvoid") :rest args)
   `
   (functionCall
-   (function
-    (funcAddr ,fun-name))
+   (@ (type ,type) (is_intrinsic "true"))
+   (name ,fun-name)
    (arguments
     ,@args)))
 
@@ -191,15 +189,15 @@
 (define gen-if
   (match-lambda*
    [(cond then)
-    `(ifStatement
+    `(FifStatement
       (condition ,cond)
-      (then ,then))]
+      (then (body ,then)))]
 
    [(cond then else)
-    `(ifStatement
+    `(FifStatement
       (condition ,cond)
-      (then ,then)
-      (else ,else))]))
+      (then (body ,then))
+      (else (body ,else)))]))
 
 (define (gen-!-expr e)
   `(logNotExpr ,e))
@@ -237,7 +235,7 @@
 (define-binop-expr gen->-expr  'logGTExpr)
 
 (define (gen-cond-expr c t f)
-  `(condExpr ,c ,t ,f))
+  (gen-funcall-expr "merge" "Fint" t f c))
 
 (define-syntax define-gen-varOP-expr
   (syntax-rules ()
@@ -278,7 +276,7 @@
     ))
 
 (define (gen-int-expr n)
-  `(intConstant ,(number->string n)))
+  `(FintConstant ,(number->string n)))
 
 (define-syntax gen-when
   (syntax-rules ()
@@ -288,143 +286,20 @@
          (gen-compound))]
     ))
 
-(define (extract-loop-counters state-for)
-  (define (normalize-cond state-cond)
-    ;; TODO
-    ;; normalize cond like PGI compiler
-    ;; for more flexibilty
-    state-cond
-    )
+(define (extract-arrayref arrayRef)
+  (let* ([name ((if-ccc-sxpath "varRef/Var") arrayRef)]
+         [indx ((sxpath "arrayIndex/*") arrayRef)])
+    `(,name ,@indx)))
 
-  ;; '((varname . op until) ...)
-  (define (extract-cond-vars state-cond)
-    ;; var (<=|<) expr
-    (case (sxml:name state-cond)
-      [(logLEExpr logLTExpr)
-       (let1 c (sxml:content state-cond)
-         (and (eq? (sxml:name (~ c 0)) 'Var)
+(define (extract-index-range indexRange)
+  (let* ([lower ((if-ccc-sxpath "lowerBound") indexRange)]
+         [upper ((if-ccc-sxpath "upperBound") indexRange)]
+         [step  ((if-ccc-sxpath "step")       indexRange)])
+    (list lower upper step)))
 
-              (list
-               (list
-                (sxml:car-content (~ c 0))
-                (case (sxml:name state-cond)
-                  [(logLEExpr) '<=]
-                  [(logLTExpr) '<])
-                (~ c 1)))
-              ))]
-
-      [else '()]
-      ))
-
-  ;; '((varname . step) ...)
-  (define (extract-iter-vars state-iter)
-    ;; i(++|--) | (++|--)i | i (+|-)= n
-    ;; TODO
-    ;; more flexibilty
-
-    (define (inverse-sign constant)
-      (list
-       (sxml:name constant)
-       (number->string (- (string->number (sxml:car-content constant))))))
-
-    (let1 c (sxml:content state-iter)
-      (case (sxml:name state-iter)
-        [(postIncrExpr preIncrExpr postDecrExpr preDecrExpr)
-         (match-let1 (var) c
-           (or
-            (and (eq? (sxml:name var) 'Var)
-
-                 (list
-                  (cons
-                   (sxml:car-content var)
-                   (case (sxml:name state-iter)
-                     [(postIncrExpr preIncrExpr) (gen-int-expr 1)]
-                     [(postDecrExpr preDecrExpr) (gen-int-expr -1)])
-                   )))
-            '()
-            ))]
-
-        [(asgPlusExpr asgMinusExpr)
-         (match-let1 (var step) c
-           (or
-            (and (eq? (sxml:name var)  'Var)
-                 (eq? (sxml:name step) 'intConstant)
-
-                 (list
-                  (list
-                   (sxml:car-content var)
-                   (case (sxml:name state-iter)
-                     [(asgPlusExpr)  step]
-                     [(asgMinusExpr) (inverse-sign step)])
-                   )))
-            '()
-            ))]
-
-        [else '()]
-        )))
-
-  ;; '((varname start) ...)
-  (define (extract-init-vars state-init)
-    ;; i = ...
-    (let1 c (sxml:content state-init)
-      (case (sxml:name state-init)
-        [(assignExpr)
-         (match-let1 (var start) c
-           (or
-            (and (eq? (sxml:name var) 'Var)
-
-                 (list
-                  (cons
-                   (sxml:car-content var)
-                   start)))
-            '()))]
-        )))
-
-  (let* ([init ((if-ccc-sxpath "init")      state-for)]
-         [cond ((if-ccc-sxpath "condition") state-for)]
-         [iter ((if-ccc-sxpath "iter")      state-for)]
-         [cond (and cond (map normalize-cond cond))]
-         [init-vars (if init (extract-init-vars init) '())]
-         [cond-vars (if cond (extract-cond-vars cond) '())]
-         [iter-vars (if iter (extract-iter-vars iter) '())])
-
-    (filter-map
-
-     (^[ini]
-       (and-let* ([varname (car ini)]
-                  [start   (cdr ini)]
-
-                  [c       (assoc-ref cond-vars varname)]
-                  [op      (~ c 0)]
-                  [until   (~ c 1)]
-
-                  [step    (assoc-ref iter-vars varname)])
-
-         (let* ([int? (lambda (e) (eq? (sxml:name e) 'intConstant))]
-                [reducible (and (int? start) (int? until) (int? step))]
-
-                [until (if reducible
-                           (let* ([nc (.$ string->number
-                                          (cut regexp-replace #/^0(.)/ <> "#\\1")
-                                          sxml:car-content)]
-                                  [start-n (nc start)]
-                                  [until-n (nc until)]
-                                  [step-n  (nc step)]
-                                  [until-equal (eq? op '<=)]
-                                  [width (- until-n start-n (if until-equal -1 0))]
-                                  [new-until-n (+ (* (div width step-n) step-n) start-n)])
-
-                             (gen-int-expr
-                              (if (and (not until-equal) (= until-n new-until-n))
-                                  (- new-until-n step-n) new-until-n)))
-
-                           (if (eq? op '<=) until
-                               `(minusExpr ,until ,(gen-int-expr 1))))]
-
-                [op '<=])
-
-           (list varname start until step op)
-           )))
-
-     init-vars)
-    ))
+(define (extract-loop-counters state-do)
+  (let* ([var   ((if-ccc-sxpath "Var")        state-do)]
+         [range ((if-car-sxpath "indexRange") state-do)])
+    `(,var
+      ,@(extract-index-range range)
+      <=)))

@@ -1,8 +1,3 @@
-//      This file is part of JACC and is licenced under terms contained in the COPYING file
-//      
-//      Copyright (C) 2021 Barcelona Supercomputing Center (BSC)
-
-
 #include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -84,10 +79,10 @@ double jacc_time()
 
 #if !defined(JACC_OPENACC) || !defined(JACC_OPENACC_OPTION)
 #ifdef __GNUC__
-#define JACC_OPENACC gcc
-#define JACC_OPENACC_OPTION -fopenacc -foffload=nvptx-none -O2 -fno-strict-aliasing -foffload=-lm -fPIC
+#define JACC_OPENACC gfortran
+#define JACC_OPENACC_OPTION -fopenacc -foffload=nvptx-none -O3 -fno-strict-aliasing -foffload=-lm -fPIC
 #else
-#define JACC_OPENACC pgcc
+#define JACC_OPENACC pgf90
 #define JACC_OPENACC_OPTION -acc -mp -ta=tesla:cc70 -O2 -Mcuda
 #endif
 #endif
@@ -115,6 +110,7 @@ double jacc_time()
 #define jacc_acc_init __jacc_acc_init
 #define jacc_acc_shutdown __jacc_acc_shutdown
 #define jacc_optimize __jacc_optimize
+#define jacc_arg_build __jacc_arg_build
 #define JACC_ARRAY __JACC_ARRAY
 #define JACC_STATIC __JACC_STATIC
 #define JACC_PRESENT __JACC_PRESENT
@@ -128,7 +124,7 @@ static double accmu;
 
 static char JACC_TEMPDIR[0xff];
 
-#define JACC_MAX_ARGS 100
+#define JACC_MAX_ARGS 500
 
 #define JACC_TABLE_SIZE 32768
 #define TABLE_INDEX(key) (((long)key / 16) % JACC_TABLE_SIZE)
@@ -142,11 +138,9 @@ struct JaccTableEntry {
     ffi_cif cif;
     ffi_type **types;
     void **values;
-    int *elmsizes;
+    size_t *elmsizes;
 
     bool *restrictable;
-
-    bool *fixed;
 
     int warmed;
     int multi;
@@ -168,6 +162,7 @@ typedef struct JaccPresent {
     void *addr;
     size_t len;
     void **dev_addr;
+    size_t count;
 } JaccPresent;
 
 typedef struct rb_tree rb_tree;
@@ -229,6 +224,57 @@ jacc_table_delete(char *key, char *label)
     return jacc_table_manipulate(key, label, true);
 }
 
+bool is_dereferenced(JaccArg *arg)
+{
+    return (!(arg->attr & JACC_ARRAY) &&
+            arg->attr & JACC_WRITTEN &&
+            ((arg->attr & JACC_PRESENT) ||
+             ((arg->attr & JACC_REDUCTED))));
+}
+
+void jacc_arg_build(const char *type, const char *symbol, void *addr,
+                    size_t size, int attr, int dimnum, int splitdim,
+                    size_t *lbound, size_t *ubound, __JaccArg **next)
+{
+    __JaccArg *r = malloc(sizeof(__JaccArg));
+
+    int is_array = attr & __JACC_ARRAY;
+    size_t split_dimsize = is_array ? (ubound[splitdim] - lbound[splitdim] + 1) : 0;
+    size_t memdepth = 1;
+
+    if (is_array)
+        for (int i = splitdim - 1; i >= 0; i--)
+            memdepth *= ubound[i] - lbound[i] + 1;
+
+    size_t length = 1, elmsize = size;
+
+    if (is_array) {
+        for (int i = dimnum - 1; i >= 0; i--)
+            length *= ubound[i] - lbound[i] + 1;
+
+        elmsize = size / length;
+    }
+
+    int *_lb, *_ub;
+    _lb = malloc(sizeof(int) * dimnum);
+    _ub = malloc(sizeof(int) * dimnum);
+    for (int i = 0; i < dimnum; i++)
+        _lb[i] = (int)lbound[i], _ub[i] = (int)ubound[i];
+
+    *r = ((struct __JaccArg){
+            type, symbol, NULL, addr,
+            size, attr, dimnum, _lb, _ub,
+            splitdim, split_dimsize, memdepth, elmsize, *next
+         });
+
+    if (is_array)
+        r->data = &(r->addr);
+    else
+        r->data = r->addr;
+
+    *next = r;
+}
+
 JaccArg *
 jacc_arg_copy(JaccArg *arg)
 {
@@ -238,8 +284,11 @@ jacc_arg_copy(JaccArg *arg)
     JaccArg *next = jacc_arg_copy(arg->next);
 
     ret = memcpy(ret, arg, sizeof(JaccArg));
-    ret->data = malloc(arg->size);
-    ret->data = memcpy(ret->data, arg->data, arg->size);
+    // For entry->args (a2); used for write buffer for non-primary GPUs
+    if (is_dereferenced(arg)) {
+        ret->data = malloc(arg->size);
+        ret->data = memcpy(ret->data, arg->data, arg->size);
+    }
     ret->next = next;
     return ret;
 }
@@ -251,14 +300,15 @@ jacc_arg_free(JaccArg *arg)
 
     JaccArg *next = arg->next;
 
-    free(arg->data);
+    if (is_dereferenced(arg))
+        free(arg->data);
     free(arg);
     jacc_arg_free(next);
 }
 
 struct JaccTableEntry *
 jacc_table_insert(const char *code, char *label, void *kernel, size_t nargs,
-                  ffi_cif cif, ffi_type **types, void **values, int *elmsizes,
+                  ffi_cif cif, ffi_type **types, void **values, size_t *elmsizes,
                   struct JaccArg *arg, size_t id)
 {
     struct JaccTableEntry *entry = malloc(sizeof(struct JaccTableEntry));
@@ -277,10 +327,6 @@ jacc_table_insert(const char *code, char *label, void *kernel, size_t nargs,
     entry->restrictable = (bool*)malloc(sizeof(bool) * nargs);
     for (int i = 0; i < nargs; i++)
         entry->restrictable[i] = true;
-
-    entry->fixed = (bool*)malloc(sizeof(bool) * nargs);
-    for (int i = 0; i < nargs; i++)
-        entry->fixed[i] = true;
 
     entry->warmed = 0;
     entry->multi = 0;
@@ -314,117 +360,6 @@ jacc_table_entry_free(struct JaccTableEntry *entry)
     }
 }
 
-void
-jacc_arg_print_data(FILE *fp, JaccArg *arg)
-{
-    if (arg->attr & JACC_ARRAY) {
-        fprintf(fp, "(%s)%p", arg->type, *(void**)arg->data);
-    }
-    else if (strcmp(arg->type, "int") == 0)
-        fprintf(fp, "%d", *(int*)(arg->data));
-    else if (strcmp(arg->type, "float") == 0)
-        fprintf(fp, "%.30e", *(float*)(arg->data));
-    else if (strcmp(arg->type, "double") == 0)
-        fprintf(fp, "%.60le", *(double*)(arg->data));
-    else if (strcmp(arg->type, "unsigned") == 0)
-        fprintf(fp, "%uu", *(unsigned*)(arg->data));
-    else {
-        fprintf(stderr, "[JACC] Unknown type: %s of %s\n",
-                arg->type, arg->symbol);
-        exit(-1);
-    }
-}
-
-static
-ffi_type *specifier_to_ffi_type(const char *spec)
-{
-    if (strstr(spec, "*"))
-        return &ffi_type_pointer;
-    if (!strcmp(spec, "int"))
-        return &ffi_type_sint;
-    if (!strcmp(spec, "float"))
-        return &ffi_type_float;
-    if (!strcmp(spec, "double"))
-        return &ffi_type_double;
-    if (!strcmp(spec, "unsigned"))
-        return &ffi_type_uint;
-
-    fprintf(stderr, "[JACC] Could not convert to ffi_type: %s\n",
-            spec);
-    exit(1);
-
-    return &ffi_type_void;
-}
-
-static
-size_t specifier_to_element_size(const char *spec)
-{
-    if (strstr(spec, "int"))
-        return sizeof(int);
-    if (strstr(spec, "float"))
-        return sizeof(float);
-    if (strstr(spec, "double"))
-        return sizeof(double);
-    if (strstr(spec, "unsigned"))
-        return sizeof(unsigned);
-
-    fprintf(stderr, "[JACC] Could not solve the type: %s\n",
-            spec);
-    exit(1);
-
-    return 0;
-}
-
-void
-jacc_arg_print_decl(FILE *fp, JaccArg *arg, bool pointer)
-{
-    if (arg->attr & JACC_ARRAY) {
-        for (int i = 0, c; c = arg->type[i]; i++) {
-            fprintf(fp, "%c", c);
-
-            if (c == '*') {
-                if (pointer) fprintf(fp, "*");
-                fprintf(fp, "%s", arg->symbol);
-                if (pointer) fprintf(fp, "__ptr");
-            }
-        }
-    } else {
-        fprintf(fp, "%s ", arg->type);
-        if (pointer) fprintf(fp, "*");
-        fprintf(fp, "%s", arg->symbol);
-        if (pointer) fprintf(fp, "__ptr");
-    }
-}
-
-void
-jacc_arg_print_decl_restrict(FILE *fp, JaccArg *arg, bool pointer)
-{
-    if (arg->attr & JACC_ARRAY) {
-        for (int i = 0, c; c = arg->type[i]; i++) {
-            fprintf(fp, "%c", c);
-
-            if (c == '*') {
-                if (pointer) fprintf(fp, "*");
-                fprintf(fp, " restrict %s", arg->symbol);
-                if (pointer) fprintf(fp, "__ptr");
-            }
-        }
-    } else {
-        fprintf(fp, "%s ", arg->type);
-        if (pointer) fprintf(fp, "*");
-        fprintf(fp, "%s", arg->symbol);
-        if (pointer) fprintf(fp, "__ptr");
-    }
-}
-
-bool is_dereferenced(JaccArg *arg)
-{
-    return (!(arg->attr & JACC_ARRAY) &&
-            arg->attr & JACC_WRITTEN &&
-            ((arg->attr & JACC_PRESENT) ||
-             ((arg->attr & JACC_REDUCTED))));
-}
-
 struct JaccTableEntry *
 jacc_jit(const char *kernel_code, JaccArg *kernel_arg)
 {
@@ -435,7 +370,7 @@ jacc_jit(const char *kernel_code, JaccArg *kernel_arg)
 
     char code_path[0xff], lib_path[0xff], command[0xff], kernel_name[0xff];
 
-    sprintf(code_path, "%s/%d.c", JACC_TEMPDIR, kernel_count);
+    sprintf(code_path, "%s/%d.f90", JACC_TEMPDIR, kernel_count);
     sprintf(lib_path, "%s/%d.so", JACC_TEMPDIR, kernel_count);
     sprintf(command,
             STR(JACC_OPENACC) " "
@@ -454,11 +389,12 @@ jacc_jit(const char *kernel_code, JaccArg *kernel_arg)
     ffi_cif cif;
     ffi_type **types;
     void **values;
-    int *elmsizes;
+    size_t *elmsizes;
 
     for (JaccArg *arg = kernel_arg; arg != NULL; arg = arg->next) {
-        nargs += ((arg->attr & JACC_ARRAY) && (arg->attr & JACC_WRITTEN))
-            ? 3 : 1;
+        nargs += 1;
+        nargs += (arg->attr & JACC_ARRAY) ? 2 : 0;
+        nargs += ((arg->attr & JACC_ARRAY) && (arg->attr & JACC_WRITTEN)) ? 2 : 0;
         nargs += (arg->attr & JACC_REDUCTED) ? 1 : 0;
     }
     nargs++; // __gpuid
@@ -466,52 +402,56 @@ jacc_jit(const char *kernel_code, JaccArg *kernel_arg)
 
     types  = (ffi_type **)calloc(nargs, sizeof(ffi_type *));
     values = (void **)calloc(nargs, sizeof(void *));
-    elmsizes = (int *)calloc(nargs, sizeof(int));
+    elmsizes = (size_t *)calloc(nargs, sizeof(size_t));
+
+    fprintf(fp, "MODULE tmp%d \n INTERFACE\n  SUBROUTINE GOMP_barrier() BIND(C)\n  END SUBROUTINE GOMP_barrier\n  END INTERFACE\n END MODULE\n", kernel_count);
 
     // Args
-    // - pointer used for array or var_write presented/reducted
-    // - variable used for other variables
-    fprintf(fp, "#include <math.h>\n void %s (", kernel_name);
+    fprintf(fp, "subroutine %s (", kernel_name);
 
     int i = 0;
     for (JaccArg *arg = kernel_arg; arg != NULL; arg = arg->next, i++) {
         if (i != 0)
-            fprintf(fp, ", ");
+            fprintf(fp, ",&\n");
 
-        bool dereference = is_dereferenced(arg);
+        fprintf(fp, "%s", arg->symbol);
 
-        jacc_arg_print_decl(fp, arg, dereference);
+        if (!(arg->attr & JACC_ARRAY) && !is_dereferenced(arg))
+            fprintf(fp, "__a");
+
+        types[i] = &ffi_type_pointer;
 
         if (arg->attr & JACC_ARRAY) {
+            elmsizes[i] = arg->elmsize;
+
+            fprintf(fp, ", %s__rlb, %s__rub", arg->symbol, arg->symbol);
+
+            i++;
             types[i] = &ffi_type_pointer;
-            elmsizes[i] = specifier_to_element_size(arg->type);
-
-            if (arg->attr & JACC_WRITTEN) {
-                i++;
-                types[i] = &ffi_type_sint;
-                i++;
-                types[i] = &ffi_type_sint;
-
-                fprintf(fp, ", int %s__lb, int %s__ub",
-                        arg->symbol, arg->symbol);
-            }
+            i++;
+            types[i] = &ffi_type_pointer;
         }
-        else if (dereference)
+
+        if ((arg->attr & JACC_ARRAY) && (arg->attr & JACC_WRITTEN)) {
+            i++;
             types[i] = &ffi_type_pointer;
-        else
-            types[i] = specifier_to_ffi_type(arg->type);
+            i++;
+            types[i] = &ffi_type_pointer;
+
+            fprintf(fp, ", %s__lb, %s__ub", arg->symbol, arg->symbol);
+        }
 
         if (arg->attr & JACC_REDUCTED) {
             i++;
             types[i] = &ffi_type_pointer;
-            fprintf(fp, ", %s *%s__shared", arg->type, arg->symbol);
+            fprintf(fp, ", %s__shared", arg->symbol);
         }
     }
 
-    if (i != 0) fprintf(fp, ", int __gpuid");
-    if (i != 0) fprintf(fp, ", int __gpunum");
-    types[i] = &ffi_type_sint;
-    types[i+1] = &ffi_type_sint;
+    if (i != 0) fprintf(fp, ", j__gpuid");
+    if (i != 0) fprintf(fp, ", j__gpunum");
+    types[i] = &ffi_type_pointer;
+    types[i+1] = &ffi_type_pointer;
 
     if (ffi_prep_cif(&cif, FFI_DEFAULT_ABI, nargs,
                      &ffi_type_void, types) != FFI_OK) {
@@ -519,26 +459,72 @@ jacc_jit(const char *kernel_code, JaccArg *kernel_arg)
         exit(-1);
     }
 
-    fprintf(fp, ")\n{\n");
+    fprintf(fp, ") BIND(C)\n");
 
-    // Constant variables
+    fprintf(fp, "use tmp%d\n", kernel_count);
+
+    // TODO: parameter
+
+    // Args
     for (JaccArg *arg = kernel_arg; arg != NULL; arg = arg->next) {
-        if (is_dereferenced(arg)) {
-            jacc_arg_print_decl(fp, arg, false);
+        int is_complex = (strstr(arg->type, "complex") != NULL);
 
-            fprintf(fp, " = ");
+        if (arg->attr & JACC_ARRAY) {
+            fprintf(fp, "integer :: %s__rlb(%d), %s__rub(%d)\n",
+                    arg->symbol, arg->dimnum, arg->symbol, arg->dimnum);
 
-            fprintf(fp, "(*(%s__ptr))", arg->symbol);
-
-            fprintf(fp, ";\n");
+            fprintf(fp, "%s(%zu), parameter :: %s__zero = ",
+                    arg->type, arg->elmsize / (is_complex ? 2 : 1), arg->symbol);
+            if (is_complex)
+                fprintf(fp, "(0._%zu, 0._%zu)", arg->elmsize / 2, arg->elmsize / 2);
+            else
+                fprintf(fp, "%s_%zu",
+                        strstr(arg->type, "integer") ? "0" : "0.", arg->elmsize);
+            fprintf(fp, "\n");
         }
+
+        if (arg->attr & JACC_WRITTEN)
+            fprintf(fp, "%s(%zu), target :: %s",
+                    arg->type, arg->elmsize / (is_complex ? 2 : 1), arg->symbol);
+        else
+            fprintf(fp, "%s(%zu) :: %s",
+                    arg->type, arg->elmsize / (is_complex ? 2 : 1), arg->symbol);
+
+        if (arg->attr & JACC_ARRAY) {
+            fprintf(fp, "(");
+            for (int d = 1; d <= arg->dimnum; d++) {
+                if (d != 1) fprintf(fp, ", ");
+                fprintf(fp, "%s__rlb(%d):%s__rub(%d)",
+                        arg->symbol, d, arg->symbol, d);
+            }
+            fprintf(fp, ")");
+        }
+        fprintf(fp, "\n");
+
+        if (arg->attr & JACC_REDUCTED)
+            fprintf(fp, "%s(%zu) :: %s__shared(0:j__gpunum)\n",
+                    arg->type, arg->elmsize / (is_complex ? 2 : 1), arg->symbol);
+
+        if (!(arg->attr & JACC_ARRAY) && !is_dereferenced(arg))
+            fprintf(fp, "%s(%zu) :: %s__a\n",
+                    arg->type, arg->elmsize / (is_complex ? 2 : 1), arg->symbol);
+
+        if ((arg->attr & JACC_ARRAY) && (arg->attr & JACC_WRITTEN))
+            fprintf(fp, "integer :: %s__lb, %s__ub\n",
+                    arg->symbol, arg->symbol);
     }
 
-    fputs("#define deviceptr present\n", fp);
-    fputs("#define async\n", fp);
-#ifdef __GNUC__
-    fputs("#define num_workers(a)\n", fp);
-#endif
+    fprintf(fp, "integer :: j__gpuid, j__gpunum, i\n");
+
+    // %s = %s__a  (Use local variables for read-only use to avoid PGI's bugs)
+    for (JaccArg *arg = kernel_arg; arg != NULL; arg = arg->next)
+        if (!(arg->attr & JACC_ARRAY) && !is_dereferenced(arg))
+            fprintf(fp, "%s = %s__a\n", arg->symbol, arg->symbol);
+
+/*     fputs("#define DEVICEPTR PRESENT\n", fp); */
+/* #ifdef __GNUC__ */
+/*     fputs("#define NUM_WORKERS(a)\n", fp); */
+/* #endif */
 
     fputs(kernel_code, fp);
 
@@ -546,49 +532,41 @@ jacc_jit(const char *kernel_code, JaccArg *kernel_arg)
 
     for (JaccArg *arg = kernel_arg; arg != NULL; arg = arg->next)
         if (arg->attr & JACC_REDUCTED) {
-            fprintf(fp, "%s__shared[__gpuid] = %s;\n",
-                    arg->symbol, arg->symbol);
+            fprintf(fp, "%s__shared(j__gpuid) = %s\n", arg->symbol, arg->symbol);
         }
 
 #ifdef __GNUC__
-    fputs("GOMP_barrier();\n", fp);
+    fputs("call GOPM_barrier\n", fp);
 #else
-    fputs("#pragma omp barrier\n", fp);
+    fputs("!$omp barrier\n", fp);
 #endif
 
-    // Assign to the address to which pointers indicate.
-    // Only for var_write presented/reducted.
-    for (JaccArg *arg = kernel_arg; arg != NULL; arg = arg->next) {
+    for (JaccArg *arg = kernel_arg; arg != NULL; arg = arg->next)
         if (arg->attr & JACC_REDUCTED) {
-            fprintf(fp, "for (int i=1; i<=__gpunum-1; i++)\n");
+            fprintf(fp, "do i=1,j__gpunum-1\n");
             fprintf(fp, "  %s = ", arg->symbol);
-            if (arg->split_dimsize >= 0 && arg->split_dimsize <= 7)
-                fprintf(fp, "%s %s %s__shared[i]",
+            if (arg->splitdim >= 0 && arg->splitdim <= 4)
+                fprintf(fp, "%s %s %s__shared(i)\n",
                         arg->symbol,
-                        (arg->split_dimsize == 0) ? "+" :
-                        (arg->split_dimsize == 1) ? "-" :
-                        (arg->split_dimsize == 2) ? "*" :
-                        (arg->split_dimsize == 3) ? "&&" :
-                        (arg->split_dimsize == 4) ? "||" :
-                        (arg->split_dimsize == 5) ? "&" :
-                        (arg->split_dimsize == 6) ? "|" :
-                        (arg->split_dimsize == 7) ? "^" : "NONE",
+                        (arg->splitdim == 0) ? "+" :
+                        (arg->splitdim == 1) ? "-" :
+                        (arg->splitdim == 2) ? "*" :
+                        (arg->splitdim == 3) ? ".and." :
+                        (arg->splitdim == 4) ? ".or." : "NONE",
                         arg->symbol);
             else
-                fprintf(fp, "%s(%s, %s__shared[i])",
-                        (arg->split_dimsize == 8) ? "fmin" :
-                        (arg->split_dimsize == 9) ? "fmax" : "NONE",
+                fprintf(fp, "%s(%s, %s__shared(i))\n",
+                        (arg->splitdim == 5) ? "iand" :
+                        (arg->splitdim == 6) ? "ior" :
+                        (arg->splitdim == 7) ? "ieor" :
+                        (arg->splitdim == 8) ? "min" :
+                        (arg->splitdim == 9) ? "max" : "NONE",
                         arg->symbol, arg->symbol);
 
-            fprintf(fp, ";\n");
+            fprintf(fp, "end do\n");
         }
-        if (is_dereferenced(arg)) {
-            fprintf(fp, "if (__gpuid == 0) (*(%s__ptr)) = %s;\n",
-                    arg->symbol, arg->symbol);
-        }
-    }
 
-    fprintf(fp, "}\n", kernel_name);
+    fprintf(fp, "\nend subroutine %s", kernel_name);
 
     fclose(fp);
 
@@ -671,20 +649,20 @@ jacc_perform_kernel(const char *kernel_code, JaccArg *kernel_arg)
             }
         }
 
-        if (entry->fixed[i]) {
-            if (a1->attr & JACC_ARRAY ||
-                a1->attr & JACC_WRITTEN ||
-                memcmp(a1->data, a2->data, a1->size)) {
-                entry->fixed[i] = false;
-            }
-        }
-
         bool dereferenced = is_dereferenced(a1);
 
         if (dereferenced && JACC_NUMGPUS >= 2)
             memcpy(a2->data, a1->data, a1->size);
 
-        entry->values[i] = dereferenced ? &(a1->addr) : a1->data;
+        // All aguments are passed as pointers
+        entry->values[i] = &(a1->addr);
+
+        if ((a1->attr & JACC_ARRAY)) {
+            i++;
+            ps[i] = NULL;
+            i++;
+            ps[i] = NULL;
+        }
 
         if ((a1->attr & JACC_ARRAY) && (a1->attr & JACC_WRITTEN)) {
             i++;
@@ -719,11 +697,11 @@ jacc_perform_kernel(const char *kernel_code, JaccArg *kernel_arg)
         copied[i] = false;
 
         if ((arg->attr & JACC_ARRAY) && (arg->attr & JACC_WRITTEN)) {
-            pad[i] = (long)arg->addr - (long)ps[i]->addr;
+            pad[i] = ps[i] ? (long)arg->addr - (long)ps[i]->addr : 0;
             split_dimsize[i] = arg->split_dimsize;
             memdepth[i] = arg->memdepth;
 
-            long elmnum = (ps[i]->len - pad[i]) / entry->elmsizes[i];
+            long elmnum = ps[i] ? (ps[i]->len - pad[i]) / entry->elmsizes[i] : 0;
 
             if (split_dimsize[i] == 0)
                 split_dimsize[i] = elmnum / memdepth[i];
@@ -789,6 +767,12 @@ jacc_perform_kernel(const char *kernel_code, JaccArg *kernel_arg)
             i += 2;
         }
 
+        if ((arg->attr & JACC_ARRAY)) {
+            copied[i+1] = false;
+            copied[i+2] = false;
+            i += 2;
+        }
+
         if (arg->attr & JACC_REDUCTED) {
             copied[i+1] = NULL;
             i++;
@@ -809,6 +793,7 @@ jacc_perform_kernel(const char *kernel_code, JaccArg *kernel_arg)
 
         void *avalue[JACC_MAX_ARGS];
         void *avalue_p[JACC_MAX_ARGS];
+        long boundary_padded[JACC_MAX_ARGS];
         double writesize = 0.0;
 
         i = 0;
@@ -830,9 +815,26 @@ jacc_perform_kernel(const char *kernel_code, JaccArg *kernel_arg)
                     lb_set[n][i] = 0;
                     ub_set[n][i] = tail[i];
                 }
+                if (!ps[i]) {
+                    copied[i] = false;
+                    lb_set[n][i] = 0;
+                    ub_set[n][i] = split_dimsize[i] - 1;
+                }
 
-                avalue[i+1] = &lb_set[n][i];
-                avalue[i+2] = &ub_set[n][i];
+                avalue[i+1] = &(arg->lbound);
+                avalue[i+2] = &(arg->ubound);
+                boundary_padded[i+3] = lb_set[n][i] + arg->lbound[arg->splitdim];
+                boundary_padded[i+4] = ub_set[n][i] + arg->lbound[arg->splitdim];
+                avalue_p[i+3] = &(boundary_padded[i+3]);
+                avalue_p[i+4] = &(boundary_padded[i+4]);
+                avalue[i+3] = &avalue_p[i+3];
+                avalue[i+4] = &avalue_p[i+4];
+
+                i += 4;
+            }
+            else if ((arg->attr & JACC_ARRAY)) {
+                avalue[i+1] = &(arg->lbound);
+                avalue[i+2] = &(arg->ubound);
 
                 i += 2;
             }
@@ -845,8 +847,9 @@ jacc_perform_kernel(const char *kernel_code, JaccArg *kernel_arg)
         }
 
         // __gpuid
-        avalue[i] = &n;
-        avalue[i+1] = &JACC_NUMGPUS;
+        void *n_p = &n, *ng_p = &JACC_NUMGPUS;
+        avalue[i] = &n_p;
+        avalue[i+1] = &ng_p;
 
         double start = jacc_time();
 
@@ -855,7 +858,7 @@ jacc_perform_kernel(const char *kernel_code, JaccArg *kernel_arg)
         ffi_call(&entry->cif, (void (*)(void))entry->kernel,
                  &kernel_result, avalue);
 
-/* #pragma omp barrier */
+/* #pragma omp barrier (now in function) */
 
         double kernel = jacc_time();
 
@@ -909,12 +912,21 @@ jacc_perform_kernel(const char *kernel_code, JaccArg *kernel_arg)
                 entry->tuned = 1;
                 entry->exec_count = 0;
             }
+
+                /* for (i = 0; i < entry->nargs; i++) { */
+                /*     if (copied[i]) { */
+                /*         printf("%d %d: kernel: %lf comm-size: %lf (%ld ~ %ld)\n", entry->id, n, (kernel - start), writesize, lb_set[n][i], ub_set[n][i]);  */
+                /*     } */
+                /*     } */
+
         }
 
         else if (entry->multi && n == 0) {
             double benefit =
                 MIN(entry->exec_to_writesize * writesize,
                     (kernel - start) * JACC_NUMGPUS) - (comm - start);
+
+            /* printf("%d: %lf kernel: %lf comm: %lf\n", entry->id, benefit, kernel - start, comm - kernel); */
 
             entry->exec_ave =
                 (entry->exec_ave * entry->exec_count + benefit) / (entry->exec_count + 1);
@@ -938,32 +950,37 @@ jacc_perform_kernel_optimized(const char *kernel_code, JaccArg *kernel_arg)
 }
 
 void
-jacc_kernel_push(const char *kernel_code, JaccArg *kernel_arg)
+jacc_kernel_push(const char *kernel_code, JaccArg **kernel_arg)
 {
     int i = 0;
-    for (JaccArg *arg = kernel_arg; arg != NULL; arg = arg->next, i++) {
+    for (JaccArg *arg = *kernel_arg; arg != NULL; arg = arg->next, i++) {
         if (((arg->attr & JACC_ARRAY) && (arg->attr & JACC_PRESENT)) &&
             !jacc_lookup_present_if(arg->addr)) {
-            fprintf(stderr, "[JACC] Not present: %s\n", arg->symbol);
+            fprintf(stderr, "[JACC] Not present: %s (%p)\n", arg->symbol, arg->addr);
             exit(-1);
-        }
-
-        // Fix reference to static array
-        if (arg->attr & JACC_STATIC) {
-            arg->data = &(arg->addr);
         }
     }
 
-    jacc_perform_kernel(kernel_code, kernel_arg);
+    jacc_perform_kernel(kernel_code, *kernel_arg);
+
+    *kernel_arg = NULL;
 }
 
 void
 jacc_data_in(void *a, size_t len, void **dev_a)
 {
-    JaccPresent *p = malloc(sizeof(JaccPresent));
+    JaccPresent *p;
+
+    if (p = jacc_lookup_present_if(a)) {
+        p->count++;
+        return;
+    }
+ 
+    p = malloc(sizeof(JaccPresent));
     p->addr        = a;
     p->len         = len;
     p->dev_addr    = dev_a;
+    p->count       = 1;
 
     rb_tree_insert(JACC_PRESENT_TREE, p);
 }
@@ -971,14 +988,19 @@ jacc_data_in(void *a, size_t len, void **dev_a)
 void
 jacc_data_out(void *a, size_t len)
 {
-    rb_tree_remove(JACC_PRESENT_TREE,
-                   & (JaccPresent) { .addr = a, .len = len });
+    JaccPresent *p = jacc_lookup_present(a);
+
+    p->count--;
 }
 
 void **jacc_mm(void *src, size_t len, bool copyin)
 {
     if (strncmp(JACC_TEMPDIR, "/tmp/jacc.", 10) != 0)
         jacc_init();
+
+    JaccPresent *p = src ? jacc_lookup_present_if(src) : NULL;
+    if (p)
+        return p->dev_addr;
 
     void **ret = malloc(sizeof(void *) * JACC_NUMGPUS);
 
@@ -1007,7 +1029,13 @@ void **jacc_mm(void *src, size_t len, bool copyin)
 
 void jacc_mm_remove(void *a, bool copyout)
 {
-    JaccPresent *p = jacc_lookup_present(a);
+    JaccPresent *p = jacc_lookup_present_if(a);
+
+    if (p->count != 0)
+        return;
+
+    rb_tree_remove(JACC_PRESENT_TREE,
+                   & (JaccPresent) { .addr = a, .len = 1 });
 
     if (copyout)
         cudaMemcpy(p->addr, p->dev_addr[0], p->len, cudaMemcpyDefault);
@@ -1034,9 +1062,9 @@ void *jacc_malloc(size_t len)
 
 void jacc_free(void *a)
 {
-    jacc_mm_remove(a, false);
-
     jacc_data_out(a, 1);
+
+    jacc_mm_remove(a, false);
 }
 
 void
@@ -1058,17 +1086,17 @@ jacc_create(void *a, size_t len)
 void
 jacc_copyout(void *a, size_t len)
 {
-    jacc_mm_remove(a, true);
-
     jacc_data_out(a, len);
+
+    jacc_mm_remove(a, true);
 }
 
 void
 jacc_delete(void *a, size_t len)
 {
-    jacc_mm_remove(a, false);
-
     jacc_data_out(a, len);
+
+    jacc_mm_remove(a, false);
 }
 
 void
@@ -1100,6 +1128,7 @@ void
 jacc_init()
 {
     char *env_jacc_numgpus = getenv("JACC_NUMGPUS");
+    accmu=0.0;
 
     if (env_jacc_numgpus != NULL)
         JACC_NUMGPUS = atoi(env_jacc_numgpus);
@@ -1167,7 +1196,7 @@ void
 jacc_close()
 {
     printf("kernel: %lf\n", accmu);
-
+    
     for (int i = 0; i < JACC_TABLE_SIZE; i++)
         jacc_table_entry_free(JACC_TABLE[i]);
 
@@ -1195,5 +1224,4 @@ jacc_jit_optimize(struct JaccTableEntry *entry)
 void jacc_optimize()
 {
     OPTIMIZED=true;
-    accmu=0.0;
 }

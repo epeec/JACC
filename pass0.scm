@@ -1,11 +1,9 @@
-;;      This file is part of JACC and is licenced under terms contained in the COPYING file
-;;
-;;      Copyright (C) 2021 Barcelona Supercomputing Center (BSC)
-
 (define-module pass0
   (use util)
   (use xm)
+  (use analysis)
 
+  (use srfi-1)
   (use srfi-11)
   (use srfi-13)
   (use util.match)
@@ -77,6 +75,7 @@
       "NUM_GANGS"
       "NUM_WORKERS"
       "VECT_LEN"
+      "VECTOR_LENGTH"
       ))
 
 (define (split-acc-*-loop! state)
@@ -114,6 +113,9 @@
            (ACCPragma (string ,dirname) ,cl2 ,body)))
         ))))
 
+(define (translate-acc-parallel! state)
+  (attach-mark state))
+
 (define (translate-acc-kernels! state)
   (sxml:change! state (translate-acc-kernels state)))
 
@@ -142,8 +144,8 @@
 
 (define (parallel-attachable-form? state)
   (let1 state-name (sxml:name state)
-    (and (or (eq? state-name 'forStatement)
-             (eq? state-name 'compoundStatement))
+    (and (eq? state-name 'FdoStatement))
+    #;(and (eq? state-name 'FdoStatement)
 
          (let1 body-content ((content-car-sxpath "body") state)
            (or (every have-no-loop? body-content)
@@ -153,82 +155,154 @@
                       (if (eq? (sxml:name body-head) 'ACCPragma) #t
 
                           (parallel-attachable-form? body-head))))
-               )))))
+               )))
+    ))
 
 (define (have-no-loop? state)
   (null? 
    ((node-all
-     (ntype-names?? '(forStatement doStatement whileStatement functionCall)))
+     (ntype-names?? '(FdoStatement FdoWhileStatement)))
     state)))
+
+;; omit-loop is used for checking the existance of initialization only
+;; (thus, no need to include cond)
+(define (omit-loop index-flow)
+  (define (rec flow) (omit-loop flow))
+
+  (case (and (pair? index-flow) (car index-flow))
+    [(loop)
+     ;; also skip cond under loop
+     (append-map rec (cddr (last index-flow)))]
+
+    [(cond write read) (list index-flow)]
+
+    [else (append-map rec index-flow)]))
 
 (define (parallel-attachable-dependency? state)
   (and-let*
-      ([for-states ((node-all (ntype?? 'forStatement)) state)]
-       [(pair? for-states)]
+      ([(eq? (car state) 'FdoStatement)]
+       [var ((if-ccc-sxpath "Var") state)]
+       [index-flow (extract-index-flow state)]
+       [index-flow (flatten-index-flow (omit-loop index-flow))]
+       [(set-sequential-iterator! (list var))]
+       [env (construct-env-dependency index-flow)]
+       [reads (filter-map (^(x) (and (eq? (car x) 'read) (cddr x))) index-flow)]
+       [writes (filter-map (^(x) (and (eq? (car x) 'read) (cddr x))) index-flow)]
 
-       ;; Each forStatement must have valid iteration
-       [(every (.$ pair? extract-loop-counters) for-states)]
+       [i-ref
+        (filter-map
+         (match-lambda1 (access . reads)
+           (and
+            (= (length access) 1)
+            (any
+             (lambda (x) (equal? (revert-tag (car x)) var))
+             reads)
+            (revert-tag (car access))))
+         env)]
 
-       ;; state of innermost forStatement
-       [innermost-body ((car-sxpath "body") (last for-states))]
+       [i-ref (cons var i-ref)]
 
-       [assigns ((node-all (ntype?? 'assignExpr)) innermost-body)]
-       [arrayrefs ((node-all (ntype?? 'arrayRef)) innermost-body)]
+       [no-i-ref?
+        (^(x) (null? (lset-intersection equal? ((sxpath '(// *text*)) (cons 'top x)) i-ref)))])
 
-       [group-indexes
-        (lambda (indexes)
-          (map
-           (lambda (k) (cons (caar k) (map cdr k)))
-           (group-collection indexes :key car :test string=?)))]
+    ;; Detect loop-carried dependencies
+    ;;   (Note: normal index-flow contains `cond` , therefore each alist in env has self-reference)
+    ;;
+    ;; Check whether an updated a[x] found in dependencies
+    ;;  - i.g. a[i] = a[i-1]
+    ;;    => variable or similar-access (but not the exactly same address)
+    ;;       where iterator-based values are used except by itself
+    ;;
+    ;; OK:
+    ;;  x = ...
+    ;;  a[x] = ...
+    ;;  a[i]++;
+    ;;
+    ;; TODO: when i-ref (variables derived from iterator) could cause random access
+    ;;
+    ;; Support this case by checking the position of initialization
+    ;; (TODO: precise analysis of conditions, such as initialization in non-executed loops)
+    ;;  for (i)
+    ;;   for (j)
+    ;;     a[x] +=..
+    ;;     sum += ..
+    ;;
+    ;; TODO: (check in a reversive order like in mark-duplicated-statement )
+    ;;  for (i)
+    ;;     x = last;
+    ;;     ..;
+    ;;     last = i;
+    ;;
+    ;; TODO: also detect this case  (value updated in the last iteration)
+    ;;
+    ;;   for() {
+    ;;    a[i]++;         // this case is ignored when i is in i-ref (iterator)
+    ;;    a[100]=a[i]+1;  // self-reference from a[100] to a[100];
+    ;;   }
+    ;;
 
-       [indexes-set
-        (group-indexes
-         (map
-          (lambda (ar)
-            (match-let1 (addr index) (sxml:content ar)
-              (cons (sxml:car-content addr) index)))
-          arrayrefs))]
+    (and
+     ;; Check array writes with index of i-ref and check similar access in dependencies but not the same one
+     (every
+      (lambda (access)
+       (or
+        (no-i-ref? (cdr access))
 
-       [all-write-indexes
-        (map
-         (lambda (as)
-           (match-let1 (lv _) (sxml:content as)
-             (and
-              (eq? (sxml:name lv) 'arrayRef)
-              (match-let1 (addr index) (sxml:content lv)
-                (cons (sxml:car-content addr) index)))))
-         assigns)]
-
-       ;; All assignments must be to array elements
-       ;; TODO: iterative data-flow analysis for more accuracy
-       [(every values all-write-indexes)]
-
-       [write-indexes-set (group-indexes all-write-indexes)])
-
-    (every
-     (lambda (indexes)
-       (match-let1 (var . vals) indexes
-         (let1 write-indexes-vals (assoc-ref write-indexes-set var)
+        (every
+         (lambda (r)
            (or
-            ;; read only
-            (not write-indexes-vals)
+            (not (similar-address? r access))
+            (every
+             (^(a b) (or (no-i-ref? a)
+                         (no-i-ref? b)
+                         (expr-equal? a b)))
+             r access)))
+         reads)
+        ))
+      writes)
 
-            ;; write only
-            (= (length vals) (length write-indexes-vals))
+    ;; omit loop -> dependencies -> check self references (is there any initialization?)
+    ;;  (except when the access has i-ref)
+    (let* ([self-ref
+            (map
+             (match-lambda1 (access . reads)
+              (cons
+               (revert-tag (car access))
+               (or
+                ;; access containing i-ref
+                (not (no-i-ref? (cdr access)))
+                ;; every dependency is not self-referencing
+                (every
+                 (lambda (x)
+                   (not (access-equal? access x)))
+                 reads)
+                )))
+             env)]
 
-            ;; all vals are same
-            ;; TODO: normalize expression of vals
-            (= (length (delete-duplicates vals)) 1)
-            ))))
-     indexes-set)
-    ))
+           [col (group-collection self-ref :key car :test string=?)])
+      
+      (every
+       (lambda (c)
+         (find values (map cdr c)))
+       col))
+    )))
 
 (define (attach-parallel state clauses)
   (let1 clauses (append clauses (collect-parallel-size! state))
     `(ACCPragma
+      (@ (jacc_kernel "1"))
       (string "PARALLEL")
       ,clauses
-      ,state)))
+      ,(attach-mark state))))
+
+(define (attach-mark state)
+  (for-each
+   (lambda (d)
+     (when (parallel-attachable-dependency? d)
+       (sxml:add-attr! d '(jacc_loop "1"))
+       ))
+   ((node-all (ntype?? 'FdoStatement)) state))
+  state)
 
 (define (collect-parallel-size! state)
   (filter-map
@@ -253,32 +327,6 @@
       "NUM_WORKERS"
       "VECT_LEN"))
 
-(define (remove-parallelism-clauses! state)
-  (match-let1 (_ clauses _) (sxml:content state)
-    (let-values ([(_ new-clauses) (separate-acc-parallelism-clauses clauses)])
-      (sxml:change-content! clauses (cdr new-clauses))
-      )))
-
-(define (divide-gangs-by-numgpus! state)
-  (map
-   (lambda (c)
-     (let1 content (sxml:content c)
-       (sxml:change-content!
-        c
-        `(,(~ content 0)
-          (condExpr
-           (Var "__macc_multi")
-           (divExpr
-            (minusExpr
-             (plusExpr ,(~ content 1) (Var "__MACC_NUMGPUS"))
-             (intConstant "1"))
-            (Var "__MACC_NUMGPUS"))
-           ,(~ content 1)))
-        )))
-   ((sxpath
-     `(// (list (string *text* ,(make-sxpath-query #/^NUM_GANGS$/)))))
-    state)))
-
 (define (pass0 xm)
   (rlet1 xm (xm-copy xm)
     (let* ([decls (xm-global-declarations xm)]
@@ -287,5 +335,6 @@
               (for-each proc ((sxpath `(// (ACCPragma (string *text* ,(make-sxpath-query pred?))))) decls)))])
       (acc-trans! split-acc-*-loop!           #/^(KERNELS|PARALLEL)_LOOP$/)
       (acc-trans! split-acc-data-clauses!     #/^(KERNELS|PARALLEL)$/)
+      (acc-trans! translate-acc-parallel!     #/^PARALLEL$/)
       (acc-trans! translate-acc-kernels!      #/^KERNELS$/)
       )))

@@ -1,7 +1,3 @@
-;;      This file is part of JACC and is licenced under terms contained in the COPYING file
-;;
-;;      Copyright (C) 2021 Barcelona Supercomputing Center (BSC)
-
 (use sxml.ssax)
 (use sxml.serializer)
 
@@ -18,8 +14,8 @@
   (let* ([iport    (current-input-port)]
          [oport    (current-output-port)]
          [sxml-in  (ssax:xml->sxml iport '())]
-         [xm-in    (sxml->xm (~ sxml-in 2))]
+         [xm-in    (sxml->xm (last sxml-in))]
          [xm-out   (xm->sxml (macc xm-in))]
-         [sxml-out (append (take sxml-in 2) (list xm-out))])
+         [sxml-out (append (drop-right sxml-in 1) (list xm-out))])
     (srl:sxml->xml sxml-out oport))
   0)
