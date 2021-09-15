@@ -1,11 +1,6 @@
-;;      This file is part of JACC and is licenced under terms contained in the COPYING file
-;;
-;;      Copyright (C) 2021 Barcelona Supercomputing Center (BSC)
-
 (define-module pass2
   (use util)
   (use xm)
-  (use analysis)
 
   (use srfi-1)
   (use srfi-11)
@@ -111,7 +106,9 @@
 
     (gen-funcall
      fun-name
-     `(plusExpr ,var ,(gen-*-expr (cons start (cdr len))))
+     `(plusExpr
+       ,var
+       (mulExpr ,type-size ,(gen-*-expr (cons start (cdr len)))))
      `(mulExpr ,type-size ,(gen-*-expr len)))
     ))
 
@@ -138,7 +135,9 @@
 
     (gen-funcall
      fun-name
-     `(plusExpr ,var ,(gen-*-expr (cons start (cdr len))))
+     `(plusExpr
+       ,var
+       (mulExpr ,type-size ,(gen-*-expr (cons start (cdr len)))))
      `(mulExpr ,type-size ,(gen-*-expr len)))
     ))
 
@@ -204,9 +203,6 @@
            ((plusExpr (* 1)) (,(sxpath:name 'Var))) *text*)) state)
     )))
 
-(define (extract-assign state)
-  ((sxpath `(// (not@ init) (((or@ ,@XM_ASSIGNS))))) (list 'top state)))
-
 (define (extract-array-type-definition type xm)
   ((if-car-sxpath
     `((((or@ pointerType arrayType))
@@ -228,7 +224,7 @@
       )))
 
 (define (xcodeml-expr->string e :optional (rename values))
-  (define (r e) (xcodeml-expr->string e rename))
+  (define r (lambda (x) (xcodeml-expr->string x rename)))
   (match (cons (sxml:name e) (sxml:content e))
     [('plusExpr a b)
      #"(~(r a) + (~(r b)))"]
@@ -251,21 +247,9 @@
     [else
      (error #"Unknown expr: ~e")]))
 
-(define (generate-var-type-specifier type xm)
-  (if-let1
-   bt ((if-car-sxpath
-        `((((or@ basicType))
-           (@ (type ((equal? ,type))))))) (xm-type-table xm))
-
-   (let* ([name ((car-sxpath '(@ name *text*)) bt)]
-          [const (equal? ((if-car-sxpath '(@ is_const *text*)) bt) "1")])
-     ;(if const #"const ~name" name)
-     name)
-
-   type))
-
 ;; Return "double (*)[n][m]"
-(define (generate-array-type-specifier type xm rename :optional (prefix ""))
+(define (generate-array-type-specifier
+         type xm rename :optional (prefix ""))
   (let1 type-definition (extract-array-type-definition type xm)
 
     (match type-definition
@@ -287,32 +271,7 @@
               (string-append
                prefix "[" array-size "]"))))]
 
-      [else #"~(generate-var-type-specifier type xm) (*)~prefix"]
-      )))
-
-(define (extract-array-element-type type xm)
-  ((#/^([^ ]*) \(/ (generate-array-type-specifier type xm values)) 1))
-
-(define (extract-array-size type xm)
-  (let1 type-definition (extract-array-type-definition type xm)
-
-    (match type-definition
-      ;; pointerType must refer one of arrayType or scalar types.
-      [('pointerType _ ...)
-       (cons #f (extract-array-size (sxml:attr type-definition 'ref) xm))]
-
-      [('arrayType _ ...)
-       (let* ([array-size (sxml:attr type-definition 'array_size)]
-              [array-size
-               (cond [(not array-size) #f]
-                     [(not (equal? array-size "*"))
-                      `(intConstant (@ (type "int")) ,array-size)]
-                     [else (car ((sxpath "arraySize/*") type-definition))])])
-         (cons array-size
-               (extract-array-size
-                (sxml:attr type-definition 'element_type) xm)))]
-
-      [else '()]
+      [else #"~type (*)~prefix"]
       )))
 
 (define (collect-array-type-definition type xm)
@@ -331,35 +290,17 @@
       [else '()]
       )))
 
-(define XM_ASSIGNS
-  '(postIncrExpr postDecrExpr
-    preIncrExpr preDecrExpr
-    assignExpr asgPlusExpr asgMinusExpr
-    asgMulExpr asgDivExpr asgModExpr
-    asgLshiftExpr asgRshiftExpr
-    asgBitAndExpr asgBitOrExpr
-    asgBitXorExpr))
-
-(define (extract-array-write state)
-  ((sxpath `(// (((or@ ,@XM_ASSIGNS)
-                  ((,(make-sxpath-query
-                      (lambda (x)
-                        (let1 n (car (sxml:car-content x))
-                              (or (eq? n 'arrayRef) (eq? n 'pointerRef)) ))
-                      )) ))))) state))
-
-(define (extract-array-read state)
-  (append
-   ((sxpath `(// (not@ ,@XM_ASSIGNS) (or@ arrayRef pointerRef))) state)
-   ((sxpath `(// (or@ ,@XM_ASSIGNS)
-                 (((* 2)) (,(sxpath:name 'arrayRef))))) state)
-   ((sxpath `(// (or@ ,@XM_ASSIGNS)
-                 (((* 2)) (,(sxpath:name 'pointerRef))))) state)))
+(define KERNEL_COUNT 0)
 
 (define (jit-acc-parallel! xm state)
-  (let* ([state-orig      state] ; for sxml:change!
+  (let* (;; PGI doesn't accept long variables
+         ;;[timestamp (sys-strftime "%H%M%S" (sys-localtime (sys-time)))]
+         ;;[timestamp
+         ;; (string-take #"~|timestamp|~(~ (current-time) 'nanosecond)" 9)]
+         [timestamp (inc! KERNEL_COUNT)]
+         [add-timestamp (lambda (x) #"~|x|_~|timestamp|")]
+         [state-orig      state] ; for sxml:change!
          [state           (list-copy-deep state)]
-         [add-underscore (lambda (x) #"__~|x|")]
 
          [referenced-vars
           (append
@@ -393,47 +334,13 @@
            (lset-difference
             equal? referenced-vars declared-vars external-arrays))]
 
-         [delete-one
-          (lambda (x lst)
-            (let loop ([lst lst])
-              (cond [(null? lst) '()]
-                    [(equal? (car lst) x) (cdr lst)]
-                    [else (cons (car lst) (loop (cdr lst)))])))]
-
-         [innermost-parallel-state
-          (extract-innermost-parallel-region state)]
-
          [reducted-vars
-          (let* ([sx
-                  (sxpath
-                   `(// ,(sxpath:name 'ACCPragma)
-                        list
-                        (list (string *text* ,(make-sxpath-query #/^REDUCTION_/)))
-                        list Var *text*))]
-                 [parent (sx state)]
-                 [child  (sx innermost-parallel-state)])
-            (fold delete-one parent child))]
-
-         [reduction-list
           ((sxpath
             `(// ,(sxpath:name 'ACCPragma)
                  list
-                 (list (string *text* ,(make-sxpath-query #/^REDUCTION_/)))))
+                 (list (string *text* ,(make-sxpath-query #/^REDUCTION_/)))
+                 list Var *text*))
            state)]
-
-         [reduction-label
-          (append-map
-           (^(r)
-             (let1 label ((car-sxpath '(string *text*)) r)
-               (map (cut cons <> label) ((sxpath '(list Var *text*)) r))))
-           reduction-list)]
-
-         [find-iterator (sxpath `(// init assignExpr (* 1) ,(sxpath:name 'Var) *text*))]
-
-         [sequential-iterators (find-iterator innermost-parallel-state)]
-
-         [parallel-iterators
-          (fold delete-one (find-iterator state) sequential-iterators)]
 
          [unused-presented-vars
           (delete-duplicates
@@ -458,10 +365,6 @@
                  (error #"Array type not found: ~name")))
            external-arrays)]
 
-         [array-size-alist
-          (map cons external-arrays
-               (map (cut extract-array-size <> xm) array-types))]
-
          [array-definitions
           (append-map (cut collect-array-type-definition <> xm) array-types)]
 
@@ -479,142 +382,17 @@
 
          [compound-for-jit-code
           (let1 def
-              (append-map
-               (^[symbol type is-array]
-                 (let1 type (if is-array (add-pointer-type! xm type) type)
-                   `((,type ,symbol)
-                     ,@(if is-array `( ("int" ,#"~|symbol|__lb")
-                                       ("int" ,#"~|symbol|__ub") ) '() ))))
-               (append external-arrays external-vars)
-               (append array-types var-types)
-               (append array-types (map not var-types)))
+              (map (^[symbol type is-array]
+                     (list
+                      (if is-array (add-pointer-type! xm type) type)
+                      symbol))
+                   (append external-arrays external-vars)
+                   (append array-types var-types)
+                   (append array-types (map not var-types)))
 
-            (gen-compound-with-local-vars
-             (append '(("int" "gpunum") ("int" "gpuid")) def) state))]
+            (gen-compound-with-local-vars def state))]
 
-         [compound-for-jit-code (list-copy-deep compound-for-jit-code)]
-
-         [pragma-in-jit-code ((car-sxpath '(body ACCPragma)) compound-for-jit-code)]
-
-         [conflict (extract-conflict pragma-in-jit-code sequential-iterators)]
-
-         [dependency (extract-dependency pragma-in-jit-code sequential-iterators)]
-
-         [var-written
-          (append
-           ((sxpath `(// varAddr *text*)) state)
-           ((sxpath `(// (or@ ,@XM_ASSIGNS)
-                         (* 1) ,(sxpath:name 'pointerRef) plusExpr
-                         (* 1) ,(sxpath:name 'Var) *text*)) state)
-           ((sxpath `(// (or@ ,@XM_ASSIGNS)
-                         (* 1) ,(sxpath:name 'arrayRef) arrayAddr *text*)) state)
-           ((sxpath `(// (or@ ,@XM_ASSIGNS)
-                         (* 1) ,(sxpath:name 'Var) *text*)) state))]
-
-         [var-read
-          (append
-           ((sxpath `(// (not@ exprStatement) (or@ ,@XM_ASSIGNS)
-                         (* 1) ,(sxpath:name 'pointerRef) plusExpr
-                         (* 1) ,(sxpath:name 'Var) *text*)) state)
-           ((sxpath `(// (not@ exprStatement) (or@ ,@XM_ASSIGNS)
-                         (* 1) ,(sxpath:name 'arrayRef) arrayAddr *text*)) state)
-           ((sxpath `(// (not@ exprStatement) (or@ ,@XM_ASSIGNS)
-                         (* 1) ,(sxpath:name 'Var) *text*)) state)
-           ((sxpath `(// varAddr *text*)) state)
-           ((sxpath `(// (or@ ,@XM_ASSIGNS)
-                         (* 2) ,(sxpath:name 'pointerRef) plusExpr
-                         (* 1) ,(sxpath:name 'Var) *text*)) state)
-           ((sxpath `(// (or@ ,@XM_ASSIGNS)
-                         (* 2) ,(sxpath:name 'arrayRef) arrayAddr *text*)) state)
-           ((sxpath `(// (or@ ,@XM_ASSIGNS)
-                         (* 2) ,(sxpath:name 'Var) *text*)) state)
-           ((sxpath `(// (not@ ,@XM_ASSIGNS) pointerRef plusExpr
-                         (* 1) ,(sxpath:name 'Var) *text*)) state)
-           ((sxpath `(// (not@ ,@XM_ASSIGNS) arrayRef arrayAddr *text*)) state)
-           ((sxpath `((not@ ,@(cons 'list XM_ASSIGNS)) Var *text*))
-            (lset-difference
-             equal?
-             ((sxpath '(// (* (* Var)))) state)
-             ((sxpath `(// (pointerRef
-                            (plusExpr (((* 1) ,(sxpath:name 'Var))))))) state))))]
-
-         [var-written (delete-duplicates var-written)]
-         [var-read (delete-duplicates var-read)]
-
-         [assigns (extract-assign pragma-in-jit-code)]
-         [array-writes (extract-array-write pragma-in-jit-code)]
-         [array-reads  (extract-array-read pragma-in-jit-code)]
-
-         [dist-vars '()]
-
-         [find-output
-          (^(name set)
-            (delete-duplicates
-             (filter-map
-              (lambda (x)
-                (and (equal? name (caar x))
-                     (or (> (length (cdr x)) 1)
-                         (member (revert-tag (cadr x)) reducted-vars))
-                     (remove-tag (cdr x))))
-              set)))]
-
-         ;; array -> split-index-position
-         [split-dimention (locate-split-dimention
-                           array-writes parallel-iterators sequential-iterators)]
-
-         [gen-index1d
-          (lambda (access)
-            (let* ([name (car access)]
-                   [index (cdr access)])
-
-              (and (pair? index)
-                   (sxml:snip (~ index (assoc-ref split-dimention name))))))]
-
-         [pt (and (pair? parallel-iterators) (car parallel-iterators))]
-
-         [ps (and pt ((if-car-sxpath
-                       `(// (forStatement
-                             (init
-                              (assignExpr
-                               (Var (((equal? ,pt))))))))) state))]
-
-         [loop-counter (and ps (extract-loop-counters ps))]
-         [loop-counter (and (pair? loop-counter) (car loop-counter))]
-
-         [loop-init (and loop-counter (~ loop-counter 1))]
-         [loop-ub   (and loop-counter (~ loop-counter 2))]
-         [loop-ub   (if (and loop-counter (eq? (~ loop-counter 4) '<=))
-                        `(plusExpr ,loop-ub ,(gen-int-expr 1))
-                        loop-ub)]
-         [loop-sect (and loop-counter
-                         `(divExpr
-                           (plusExpr (minusExpr ,loop-ub ,loop-init)
-                                     (minusExpr (Var "gpunum") ,(gen-int-expr 1)))
-                           (Var "gpunum")))]
-
-         [construct-predicate
-          (match-lambda1 (name . i)
-            (if i
-                (gen-AND-expr
-                 `(,(gen-var<=-expr #"~|name|__lb" i)
-                   ,(gen-var>=-expr #"~|name|__ub" i)))
-                ;; reduction
-                ;(gen-==-expr '(Var "gpuid") (gen-int-expr 0))
-                (let1 pt (car parallel-iterators)
-                  (gen-AND-expr
-                   `(,(gen-<=-expr `(plusExpr ,loop-init
-                                              (mulExpr ,loop-sect
-                                                       (Var "gpuid")))
-                                   `(Var ,pt))
-                     ,(gen->-expr `(plusExpr ,loop-init
-                                             (mulExpr ,loop-sect
-                                                      (plusExpr (Var "gpuid")
-                                                                ,(gen-int-expr 1))))
-                                  `(Var ,pt)))))
-                ))])
-
-    (mark-duplicated-statement!
-     pragma-in-jit-code conflict dependency '() split-dimention)
+         [compound-for-jit-code (list-copy-deep compound-for-jit-code)])
 
     ;; Remove unused present vars and also scalars, that would be re-allocated
     (for-each
@@ -651,131 +429,12 @@
       (sxml:change-content!
        clauses (cons `(list (string "ASYNC")) (sxml:content clauses))))
 
-    ;; put predicate ( a[x][y]=... -> (I <= (x*N+y) <= J) ? (a[]=..) : a[]; )
-    (for-each
-     (lambda (assign)
-       (let* ([assign-orig assign]
-              [assign (list-copy-deep assign)]
-              [lv (sxml:car-content assign)]
-              [lv-orig (sxml:car-content assign-orig)])
-
-         (case (or (sxml:attr assign 'jacc_dup) (sxml:name lv))
-           [(arrayRef)
-            (let* ([c (sxml:content lv)]
-                   [name (sxml:car-content (car c))]
-                   [index (cdr c)]
-                   [out (cons `(,name ,@index)
-                              (find-output (add-tag name lv-orig) conflict))]
-                   [index-1ds (map gen-index1d out)]
-                   [filter (delete-duplicates (map cons (map car out) index-1ds))])
-
-              (unless #f #;(> (length filter) 5)
-                (push! dist-vars name)
-
-                (sxml:change!
-                 assign-orig
-                 (list-copy-deep
-                  (gen-cond-expr
-                   (gen-OR-expr (map construct-predicate filter))
-                   assign
-                   lv)))))]
-
-           [(pointerRef)
-            (and-let*
-                ([cc (sxml:car-content lv)]
-                 [(and (eq? (sxml:name cc) 'plusExpr)
-                       (eq? (sxml:name (sxml:car-content cc)) 'Var))]
-                 [name (sxml:car-content (sxml:car-content cc))]
-                 [index (cdr (sxml:content cc))]
-                 [out (cons `(,name ,@index)
-                            (find-output (add-tag name lv-orig) conflict))]
-                 [index-1ds (map gen-index1d out)]
-                 [filter (delete-duplicates (map cons (map car out) index-1ds))])
-
-                (unless #f #;(> (length filter) 5)
-                  (push! dist-vars name)
-
-                  (sxml:change!
-                   assign-orig
-                   (list-copy-deep
-                    (gen-cond-expr
-                     (gen-OR-expr (map construct-predicate filter))
-                     assign
-                     lv)))))]
-
-           [(Var)
-            (let* ([name (sxml:car-content (sxml:content lv))]
-                   [out ;; find-output returns only arrays and reducted vars
-                    (find-output (add-tag name lv-orig) conflict)]
-                   ;; only reduction; otherwise out := '()
-                   [out (if (member name reducted-vars) (cons `(,name) out) '())]
-                   [index-1ds (map gen-index1d out)]
-                   [fil (delete-duplicates (map cons (map car out) index-1ds))])
-              (when (pair? fil)
-                (sxml:change!
-                 assign-orig
-
-                 (list-copy-deep
-                  (gen-cond-expr
-                   (gen-OR-expr (map construct-predicate fil))
-                   assign
-                   lv)))))]
-           )))
-     assigns)
-
-    ;; put predicate for read
-    ;; ( a[i] -> ( ( b_lb <= ... && b_ub >= ... ) || ... ) ? a[i] : 0 )
-    (for-each
-     (lambda (fetch)
-       (let* ([fetch-orig fetch]
-              [fetch (list-copy-deep fetch)])
-
-         (case (or (sxml:attr fetch 'jacc_dup) (sxml:name fetch))
-           [(arrayRef)
-            (let* ([c (sxml:content fetch)]
-                   [name (sxml:car-content (car c))]
-                   [out  (find-output (add-tag name fetch-orig) dependency)]
-                   [index-1ds (map gen-index1d out)]
-                   [filter (delete-duplicates (map cons (map car out) index-1ds))])
-
-              (unless (or (null? filter) #f #;(> (length filter) 5))
-                (sxml:change!
-                 fetch-orig
-                 (list-copy-deep
-                  (gen-cond-expr
-                   (gen-OR-expr (map construct-predicate filter))
-                   fetch
-                   (gen-int-expr 0))))
-                ))]
-
-           [(pointerRef)
-            (and-let*
-                ([cc (sxml:car-content fetch)]
-                 [(and (eq? (sxml:name cc) 'plusExpr)
-                       (eq? (sxml:name (sxml:car-content cc)) 'Var))]
-                 [name (sxml:car-content (sxml:car-content cc))]
-                 [out  (find-output (add-tag name fetch-orig) dependency)]
-                 [index-1ds (map gen-index1d out)]
-                 [filter (delete-duplicates (map cons (map car out) index-1ds))])
-
-              (unless (or (null? filter) #f #;(> (length filter) 5))
-                (sxml:change!
-                 fetch-orig
-                 (list-copy-deep
-                  (gen-cond-expr
-                   (gen-OR-expr (map construct-predicate filter))
-                   fetch
-                   (gen-int-expr 0))))
-                ))]
-           )))
-     array-reads)
-
-    ;; Append underscore to all variables
+    ;; Append timestamp to all variables
     (for-each
      (^[v]
        (sxml:change-content!
         v
-        (list (add-underscore (sxml:car-content v)))))
+        (list (add-timestamp (sxml:car-content v)))))
      (append
       ((sxpath '(// (or@ Var varAddr arrayAddr))) compound-for-jit-code)
       ((sxpath '(// (or@ symbols declarations) (or@ id varDecl) name))
@@ -795,22 +454,19 @@
                  [is-static-array
                   (and is-array
                        (eq? 'arrayType (sxml:name type-def))
-                       (sxml:attr type-def 'array_size))]
-                 [array-size (and is-array (assoc-ref array-size-alist symbol))]
-                 [splitdim   (and is-array (assoc-ref split-dimention symbol))])
-
+                       (sxml:attr type-def 'array_size))])
             (gen-var= "__arg"
              `(compoundValueAddr (@ (type ,pointer-type-to-jacc-arg))
                (value
                 (value
                  ;; type
                  (stringConstant
-                  ,(if (not is-array)
-                       (generate-var-type-specifier type xm)
-                       (generate-array-type-specifier type xm add-underscore)))
+                  ,(if (not is-array) type
+                       (generate-array-type-specifier
+                        type xm add-timestamp)))
 
                  ;; symbol
-                 (stringConstant ,(add-underscore symbol))
+                 (stringConstant ,(add-timestamp symbol))
 
                  ;; variable address
                  (varAddr ,symbol)
@@ -832,37 +488,33 @@
                                     ,(if cond label "__JACC_NONE")))
 
                     '("__JACC_ARRAY" "__JACC_STATIC"
-                      "__JACC_PRESENT" "__JACC_REDUCTED" "__JACC_DIST"
-                      "__JACC_WRITTEN" "__JACC_READ")
+                      "__JACC_PRESENT" "__JACC_REDUCTED" "__JACC_WRITTEN")
 
                     (list is-array is-static-array
                           (member symbol presented-vars)
                           (member symbol reducted-vars)
-                          (member symbol dist-vars)
-                          (member symbol var-written)
-                          (member symbol var-read))
-                    ))
 
-                 ;; split_dimsize or reduction type
-                 ,(or (and splitdim (~ array-size splitdim))
-
-                      (gen-int-expr
-                       (match (assoc-ref reduction-label symbol)
-                         ["REDUCTION_PLUS"   0]
-                         ["REDUCTION_MINUS"  1]
-                         ["REDUCTION_MUL"    2]
-                         ["REDUCTION_LOGAND" 3]
-                         ["REDUCTION_LOGOR"  4]
-                         ["REDUCTION_BITAND" 5]
-                         ["REDUCTION_BITOR"  6]
-                         ["REDUCTION_BITXOR" 7]
-                         ["REDUCTION_MIN"    8]
-                         ["REDUCTION_MAX"    9]
-                         [else 0])))
-
-                 ;; memdepth
-                 ,(or (and splitdim (gen-*-expr (drop array-size (+ splitdim 1))))
-                      (gen-int-expr 0))
+                          (let1 assigns '(or@
+                                          postIncrExpr postDecrExpr
+                                          preIncrExpr preDecrExpr
+                                          assignExpr asgPlusExpr asgMinusExpr
+                                          asgMulExpr asgDivExpr asgModExpr
+                                          asgLshiftExpr asgRshiftExpr
+                                          asgBitAndExpr asgBitOrExpr
+                                          asgBitXorExpr)
+                            (or ((if-car-sxpath
+                                  `(// ,assigns pointerRef plusExpr
+                                       Var (equal? ,symbol))) state)
+                                ((if-car-sxpath
+                                  `(// varAddr (equal? ,symbol))) state)
+                                ((if-car-sxpath
+                                  `(// (( ,assigns (* 1)))
+                                       ,@(if is-array '(//) '())
+                                       ((,(sxpath:name
+                                           (if is-array 'arrayAddr 'Var))
+                                         (equal? ,symbol)))))
+                                 state)))
+                          )))
 
                  ;; arg->next
                  (Var "__arg")

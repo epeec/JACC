@@ -1,7 +1,3 @@
-;;      This file is part of JACC and is licenced under terms contained in the COPYING file
-;;
-;;      Copyright (C) 2021 Barcelona Supercomputing Center (BSC)
-
 (define-module xm
   (use sxml.tools)
   (use sxml.sxpath)
@@ -40,27 +36,17 @@
    gen-barrier
    gen-if
    gen-!-expr
-   gen-var-expr
    gen-!var-expr
    gen-*-expr
    gen-+-expr
    gen-==-expr
    gen-!=-expr
    gen-<-expr
-   gen-<=-expr
-   gen-AND-expr
-   gen-OR-expr
-   gen-cond-expr
    gen-var<-expr
    gen-var<var-expr
+   gen-<=-expr
    gen-var<=-expr
    gen-var<=var-expr
-   gen->-expr
-   gen->=-expr
-   gen-var>-expr
-   gen-var>var-expr
-   gen-var>=-expr
-   gen-var>=var-expr
    gen-var++-expr
    gen-for
    gen-int-expr
@@ -204,9 +190,6 @@
 (define (gen-!-expr e)
   `(logNotExpr ,e))
 
-(define (gen-var-expr varname)
-  `(Var ,varname))
-
 (define (gen-!var-expr varname)
   (gen-!-expr `(Var ,varname)))
 
@@ -224,20 +207,16 @@
            (name (cdr args)))]))]
     ))
 
-(define-expr-chain gen-*-expr 'mulExpr (gen-int-expr 1))
-(define-expr-chain gen-+-expr 'plusExpr (gen-int-expr 0))
-(define-expr-chain gen-AND-expr 'logAndExpr (gen-int-expr 1))
-(define-expr-chain gen-OR-expr 'logOrExpr (gen-int-expr 0))
+(define-expr-chain gen-*-expr 'mulExpr '(gen-int-expr 1))
+(define-expr-chain gen-+-expr 'plusExpr '(gen-int-expr 0))
 
 (define-binop-expr gen-==-expr 'logEQExpr)
 (define-binop-expr gen-!=-expr 'logNEQExpr)
 (define-binop-expr gen-<=-expr 'logLEExpr)
 (define-binop-expr gen-<-expr  'logLTExpr)
-(define-binop-expr gen->=-expr 'logGEExpr)
-(define-binop-expr gen->-expr  'logGTExpr)
 
-(define (gen-cond-expr c t f)
-  `(condExpr ,c ,t ,f))
+(define (gen-var<=-expr varname r)
+  (gen-<=-expr `(Var ,varname) r))
 
 (define-syntax define-gen-varOP-expr
   (syntax-rules ()
@@ -257,11 +236,6 @@
 (define-gen-varOPvar-expr gen-var<var-expr  gen-<-expr)
 (define-gen-varOP-expr    gen-var<=-expr    gen-<=-expr)
 (define-gen-varOPvar-expr gen-var<=var-expr gen-<=-expr)
-
-(define-gen-varOP-expr    gen-var>-expr     gen->-expr)
-(define-gen-varOPvar-expr gen-var>var-expr  gen->-expr)
-(define-gen-varOP-expr    gen-var>=-expr    gen->=-expr)
-(define-gen-varOPvar-expr gen-var>=var-expr gen->=-expr)
 
 (define (gen-var++-expr varname)
   `(postIncrExpr (Var ,varname)))
@@ -404,9 +378,7 @@
                 [reducible (and (int? start) (int? until) (int? step))]
 
                 [until (if reducible
-                           (let* ([nc (.$ string->number
-                                          (cut regexp-replace #/^0(.)/ <> "#\\1")
-                                          sxml:car-content)]
+                           (let* ([nc (.$ string->number sxml:car-content)]
                                   [start-n (nc start)]
                                   [until-n (nc until)]
                                   [step-n  (nc step)]

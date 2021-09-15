@@ -1,7 +1,3 @@
-//      This file is part of JACC and is licenced under terms contained in the COPYING file
-//      
-//      Copyright (C) 2021 Barcelona Supercomputing Center (BSC)
-
 #ifndef _JACC_H
 #define _JACC_H
 
@@ -15,9 +11,7 @@ typedef enum {
     __JACC_STATIC   = 2,
     __JACC_PRESENT  = 4,
     __JACC_REDUCTED = 8,
-    __JACC_DIST     = 16,
-    __JACC_WRITTEN  = 32,
-    __JACC_READ     = 64
+    __JACC_WRITTEN  = 16
 } __JaccArgAttr;
 
 typedef struct __JaccArg {
@@ -25,8 +19,7 @@ typedef struct __JaccArg {
 
     const char *symbol;
 
-    // variable address (No guarantee data==addr (var) or data==&addr (arr);
-    //                   Can point to allocated mem)
+    // variable address (No guarantee data==addr; Can point to allocated mem)
     void *data;
 
     // array address for arrays and variable address for variables
@@ -34,12 +27,8 @@ typedef struct __JaccArg {
 
     size_t size;
 
-    // array | static | present | reducted | dist | written | read
+    // array | static | present | reducted | written
     int attr;
-
-    size_t split_dimsize;
-
-    size_t memdepth;
 
     struct __JaccArg *next;
 } __JaccArg;
