@@ -1,0 +1,25 @@
+From 4f4e9f607b4c59b60994a829abdfaafb031075b7 Mon Sep 17 00:00:00 2001
+From: "K. Matsumura" <kazuaki.matsumura@bsc.es>
+Date: Sat, 9 Jan 2021 16:36:20 -0800
+Subject: [PATCH 6/6] Fix directive output
+
+---
+ C-BackEnd/src/xcodeml/c/decompile/XcDirectiveObj.java | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/C-BackEnd/src/xcodeml/c/decompile/XcDirectiveObj.java b/C-BackEnd/src/xcodeml/c/decompile/XcDirectiveObj.java
+index ff3f44de..030e4b57 100644
+--- a/C-BackEnd/src/xcodeml/c/decompile/XcDirectiveObj.java
++++ b/C-BackEnd/src/xcodeml/c/decompile/XcDirectiveObj.java
+@@ -9,7 +9,7 @@ import xcodeml.c.util.XmcWriter;
+  * Internal object represents following elements:
+  *   pragma, text, statement
+  */
+-public class XcDirectiveObj extends XcStmtObj implements XcDecAndDefObj, XcExprObj
++public class XcDirectiveObj extends XcStmtObj implements XcDecAndDefObj
+ {
+     private String _line;
+     private XcStmtObj _stmt = null;
+-- 
+2.20.1
+

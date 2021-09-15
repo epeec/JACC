@@ -2,4 +2,4 @@
 
 ## Requirements
 * Gauche (>= 0.9.5)
-* https://github.com/uwx/omni-compiler/tree/extend-c-decompiler
+* Omni Compiler with XcodeML-Tools (we used 5fec250 with patches found in this directory)

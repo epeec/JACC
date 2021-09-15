@@ -1,0 +1,33 @@
+From 4836615440d33bc9a546aa201ea6f68d038ba038 Mon Sep 17 00:00:00 2001
+From: Kazuaki Matsumura <kazuaki.matsumura@bsc.es>
+Date: Mon, 30 Sep 2019 15:34:18 +0200
+Subject: [PATCH 1/6] Put fulfilments for avoiding yacc's overflow
+
+---
+ C-FrontEnd/src/c-option.c | 3 +++
+ 1 file changed, 3 insertions(+)
+
+diff --git a/C-FrontEnd/src/c-option.c b/C-FrontEnd/src/c-option.c
+index b402ef71..dd47dca3 100644
+--- a/C-FrontEnd/src/c-option.c
++++ b/C-FrontEnd/src/c-option.c
+@@ -10,6 +10,8 @@
+ #define ALIGNOF_SAMPLE_STRUCT(type)   struct { char a; type b; }
+ #define ALIGNOF(type)                 OFFSETOF(ALIGNOF_SAMPLE_STRUCT(type), b)
+ 
++char fulfilment1_for_yacc_overflow[0xFFFFF];
++
+ unsigned int s_sizeAddr         = SIZEOF_VOID_P;
+ unsigned int s_sizeChar         = SIZEOF_UNSIGNED_CHAR;
+ unsigned int s_sizeWChar        = SIZEOF_UNSIGNED_LONG;
+@@ -58,6 +60,7 @@ unsigned int s_dispParseTree            = 0;
+ #define COPT_ALIGN      "--align-"
+ #define COPT_NO_WARN    "--no-warn-"
+ 
++char fulfilment2_for_yacc_overflow[0xFFFFF];
+ 
+ const char *s_inFile = NULL;
+ const char *s_outFile = NULL;
+-- 
+2.20.1
+

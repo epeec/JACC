@@ -1,0 +1,338 @@
+From cedc7f4d3c4c4101acc8608aa918a5ec0c9d9523 Mon Sep 17 00:00:00 2001
+From: Kazuaki Matsumura <kazuaki.matsumura@bsc.es>
+Date: Tue, 13 Oct 2020 19:11:43 +0200
+Subject: [PATCH 2/6] Support OpenACC Fortran
+
+---
+ .../f/decompile/XfDecompileDomVisitor.java    | 172 ++++++++++++++----
+ 1 file changed, 132 insertions(+), 40 deletions(-)
+
+diff --git a/F-BackEnd/src/xcodeml/f/decompile/XfDecompileDomVisitor.java b/F-BackEnd/src/xcodeml/f/decompile/XfDecompileDomVisitor.java
+index f8b8ee03..d0229f84 100644
+--- a/F-BackEnd/src/xcodeml/f/decompile/XfDecompileDomVisitor.java
++++ b/F-BackEnd/src/xcodeml/f/decompile/XfDecompileDomVisitor.java
+@@ -52,7 +52,7 @@ XfDecompileDomVisitor {
+     static final int PRIO_HIGH = 13;
+ 
+     static boolean in_interface = false;
+-
++  
+     static public String nodeToString(Node n) {
+         String ret = null;
+         if (n != null) {
+@@ -226,8 +226,8 @@ XfDecompileDomVisitor {
+         for (Node basicTypeNode : basicTypeNodeArray) {
+             String bind = XmDomUtil.getAttr(basicTypeNode, "bind");
+             String bind_name = XmDomUtil.getAttr(basicTypeNode, "bind_name");
+-            if (XfUtilForDom.isNullOrEmpty(bind) == false
+-                && XfUtilForDom.isNullOrEmpty(bind_name) == false)
++            if (XfUtilForDom.isNullOrEmpty(bind) == false 
++                && XfUtilForDom.isNullOrEmpty(bind_name) == false) 
+             {
+                 basicTypeAttrs.add("BIND( " + bind.toUpperCase() + ", NAME='" + bind_name + "' )");
+                 break;
+@@ -746,7 +746,7 @@ XfDecompileDomVisitor {
+         boolean isExternal = XmDomUtil.getAttrBool(topTypeChoice, "is_external");
+ 	boolean isOptional = XmDomUtil.getAttrBool(topTypeChoice, "is_optional");
+ 	boolean isSubroutine = (typeId == XfType.VOID);
+-
++      
+         // ================
+         // Top type element
+         // ================
+@@ -1395,19 +1395,11 @@ XfDecompileDomVisitor {
+      *            Grouping flag.
+      */
+     private void _writeBinaryExpr(Node leftExpr, Node rightExpr,
+-                                  String operation, boolean grouping)
+-    {
+-
++                                  String operation, boolean grouping) {
+         XmfWriter writer = _context.getWriter();
+         boolean need_paren;
+         int op_prio = operator_priority(operation);
+ 
+-        if (XmOption.isAddParEnabled() && (operation == "+" || operation == "-"
+-          || operation == "*" || operation == "/" || operation == "**"))
+-        {
+-            grouping = true;
+-        }
+-
+         if (grouping) writer.writeToken("(");
+ 
+         need_paren = false;
+@@ -4090,7 +4082,7 @@ XfDecompileDomVisitor {
+             _writeLineDirective(n);
+ 
+ 	    in_interface = true;
+-
++	    
+             XmfWriter writer = _context.getWriter();
+ 
+             String interfaceName = XmDomUtil.getAttr(n, "name");
+@@ -4156,7 +4148,7 @@ XfDecompileDomVisitor {
+             writer.setupNewLine();
+ 
+ 	    in_interface = false;
+-
++	    
+ 	    XfTypeManagerForDom typeManager = _context.getTypeManagerForDom();
+ 
+ 	    // The OPTIONAL attribute should be exceptionally handled.
+@@ -4628,9 +4620,7 @@ XfDecompileDomVisitor {
+ 
+             String content = XmDomUtil.getContentText(n);
+ 	    if (content.startsWith("cdir") == true ||
+-		content.startsWith("ocl") == true ||
+-		content.startsWith("dir") == true ||
+-		content.startsWith("pgi") == true ){
++		content.startsWith("ocl") == true ){
+ 	      content = "!" + content;
+ 	    }
+             else if (content.startsWith("!$") == false) {
+@@ -4728,7 +4718,7 @@ XfDecompileDomVisitor {
+ 		  clauseName = XmDomUtil.getContentText(clause);
+ 		  arg = clause.getNextSibling();
+ 		}
+-
++		
+ 		while (arg != null && arg.getNodeType() != Node.ELEMENT_NODE) arg = arg.getNextSibling();
+ 
+                 String operator = "";
+@@ -4842,7 +4832,7 @@ XfDecompileDomVisitor {
+             writer.incrementIndentLevel();
+ 
+ 	    if (body.getNodeName().equals("list")){
+-
++	    
+ 	      NodeList list2 = body.getChildNodes();
+ 	      for (int i = 0; i < list2.getLength(); i++){
+ 		Node childNode = list2.item(i);
+@@ -4893,7 +4883,6 @@ XfDecompileDomVisitor {
+          * Decompile "ACCPragma" element in XcodeML/F.
+          */
+         @Override public void enter(Node n) {
+-
+             _writeLineDirective(n);
+ 
+             NodeList list0 = n.getChildNodes();
+@@ -4905,7 +4894,9 @@ XfDecompileDomVisitor {
+             writer.setStatementMode(XmfWriter.StatementMode.ACC);
+ 
+             // directive
+-            Node dir = list0.item(0);
++            Node dir = n.getFirstChild();
++            while (dir.getNodeType() != Node.ELEMENT_NODE)
++                dir = dir.getNextSibling();
+             String dirName = XmDomUtil.getContentText(dir);
+ 
+             // remove underscore
+@@ -4916,7 +4907,10 @@ XfDecompileDomVisitor {
+ 
+             writer.writeToken("!$ACC " + dirName);
+ 
+-            Node clauseListNode = list0.item(1);
++            // clause
++            Node clauseListNode = dir.getNextSibling();
++            while (clauseListNode.getNodeType() != Node.ELEMENT_NODE)
++                clauseListNode = clauseListNode.getNextSibling();
+             NodeList clauseList = clauseListNode.getChildNodes();
+ 
+             int clauseListLength = clauseList.getLength();
+@@ -4938,7 +4932,11 @@ XfDecompileDomVisitor {
+             // output clauses except for the directive argument
+             for (int i = 0; i < clauseListLength; i++){
+                 Node clause = clauseList.item(i);
+-                if(i == directiveArgumentIndex) continue;
++
++                if (clause.getNodeType() != Node.ELEMENT_NODE) {
++                    continue;
++                }
++
+                 enterClause(dirName, clause);
+             }
+ 
+@@ -4946,11 +4944,12 @@ XfDecompileDomVisitor {
+             writer.setStatementMode(prevMode);
+             writer.setupNewLine();
+ 
+-
+             // bodyNode
+-            Node bodyNode = list0.item(2); //clauseListNode.getNextSibling();
+-            enterBody(bodyNode);
++            Node bodyNode = clauseListNode.getNextSibling();
++            while (bodyNode.getNodeType() != Node.ELEMENT_NODE)
++                bodyNode = bodyNode.getNextSibling();
+ 
++            enterBody(bodyNode);
+ 
+             // output end directive
+             if( dirName.equals("PARALLEL")
+@@ -4966,9 +4965,19 @@ XfDecompileDomVisitor {
+         private void enterClause(String dirName, Node n){
+             XmfWriter writer = _context.getWriter();
+ 
+-            NodeList list = n.getChildNodes();
+-            String clauseName = getClauseName(n);
+-            Node clauseArgNode = list.item(1);
++            String clauseName = XmDomUtil.getContentText(n);
++            Node clauseArgNode = n.getFirstChild().getNextSibling();
++
++            if (clauseName.trim().equals("")){
++                n = n.getFirstChild();
++                while (n.getNodeType() != Node.ELEMENT_NODE)
++                    n = n.getNextSibling();
++                clauseName = XmDomUtil.getContentText(n);
++                n = n.getNextSibling();
++                while (n != null && n.getNodeType() != Node.ELEMENT_NODE)
++                    n = n.getNextSibling();
++                clauseArgNode = n;
++            }
+ 
+             // "*"
+             if(clauseName.equals("ASTERISK")){
+@@ -5006,6 +5015,21 @@ XfDecompileDomVisitor {
+             else if (clauseName.equals("REDUCTION_EQV"))    {clauseName = "REDUCTION"; operator = ".EQV.";}
+             else if (clauseName.equals("REDUCTION_NEQV"))   {clauseName = "REDUCTION"; operator = ".NEQV.";}
+ 
++            else if (clauseName.equals("VECT_LEN"))
++                clauseName = "vector_length";
++
++            else if (clauseName.equals("PRESENT_OR_COPY"))
++                clauseName = "pcopy";
++
++            else if (clauseName.equals("PRESENT_OR_COPYIN"))
++                clauseName = "pcopyin";
++
++            else if (clauseName.equals("PRESENT_OR_COPYOUT"))
++                clauseName = "pcopyout";
++
++            else if (clauseName.equals("PRESENT_OR_CREATE"))
++                clauseName = "pcreate";
++
+             //write "clauseName"
+             if(! clauseName.equals(dirName)) {
+                 writer.writeToken(clauseName);
+@@ -5024,11 +5048,17 @@ XfDecompileDomVisitor {
+             if(clauseArgNode.getNodeName().equals("list") && !isClauseNode(clauseArgNode)){
+                 //clause arg is normal list
+                 NodeList argList = clauseArgNode.getChildNodes();
++                boolean first = true;
+                 for (int i = 0; i < argList.getLength(); i++) {
+-                    if(i != 0) writer.writeToken(",");
++                    if (argList.item(i).getNodeType() != Node.ELEMENT_NODE)
++                        continue;
++                    if(first)
++                        first = !first;
++                    else
++                        writer.writeToken(",");
+                     enterClauseArg(dirName, argList.item(i));
+                 }
+-            }else{
++            }else if (clauseArgNode.getNodeType() == Node.ELEMENT_NODE){
+                 //clause arg is normal node or clause
+                 enterClauseArg(dirName, clauseArgNode);
+             }
+@@ -5043,7 +5073,59 @@ XfDecompileDomVisitor {
+                 return;
+             }
+ 
+-            invokeEnter(n);
++            if (n.getNodeName().equals("list")) {
++                XmfWriter writer = _context.getWriter();
++
++                //array
++                String arrayDim = "";
++                NodeList array = n.getChildNodes();
++                int j = 0;
++                if (array.item(j).getNodeType() != Node.ELEMENT_NODE)
++                    j++;
++                invokeEnter(array.item(j));
++
++                boolean first = true;
++                for (j = j + 1; j < array.getLength(); j++){
++                    Node index = array.item(j);
++
++                    if (index.getNodeType() != Node.ELEMENT_NODE)
++                        continue;
++
++                    if (first) {
++                        writer.writeToken("(");
++                        first = false;
++                    } else {
++                        writer.writeToken(",");
++                    };
++
++                    if(index.getNodeName().equals("list")){
++                        Node range = index.getFirstChild();
++
++                        while (range.getNodeType() != Node.ELEMENT_NODE && range != null)
++                            range = range.getNextSibling();
++
++                        invokeEnter(range);
++
++                        do {
++                            range = range.getNextSibling();
++                        }
++                        while (range.getNodeType() != Node.ELEMENT_NODE && range != null);
++
++                        if(range != null){
++                            writer.writeToken(":");
++                            invokeEnter(range);
++                        }
++                    }else{
++                        invokeEnter(index);
++                    }
++                }
++
++                if (!first)
++                    writer.writeToken(")");
++            }
++
++            else
++                invokeEnter(n);
+         }
+ 
+         private boolean isClauseNode(Node n)
+@@ -5064,13 +5146,23 @@ XfDecompileDomVisitor {
+ 
+             writer.incrementIndentLevel();
+ 
+-            NodeList list = n.getChildNodes();
+-            for (int i = 0; i < list.getLength(); i++){
+-                Node childNode = list.item(i);
+-                if (childNode.getNodeType() != Node.ELEMENT_NODE) {
+-                    continue;
++            if (n.getNodeName().equals("list")){
++                NodeList list2 = n.getChildNodes();
++                for (int i = 0; i < list2.getLength(); i++){
++                    Node childNode = list2.item(i);
++                    if (childNode.getNodeType() != Node.ELEMENT_NODE) {
++                        continue;
++                    }
++                    else if (childNode.getNodeName().equals("list")){
++                        childNode = childNode.getFirstChild();
++                        while (childNode.getNodeType() != Node.ELEMENT_NODE)
++                            childNode = childNode.getNextSibling();
++                    }
++                    invokeEnter(childNode);
+                 }
+-                invokeEnter(childNode);
++            }
++            else {
++                invokeEnter(n);
+             }
+ 
+             writer.decrementIndentLevel();
+@@ -6184,7 +6276,7 @@ XfDecompileDomVisitor {
+ 		  writer.writeToken(":");
+ 		  invokeEnter(step);
+ 		}
+-
++		
+                 return;
+             }
+ 
+-- 
+2.20.1
+

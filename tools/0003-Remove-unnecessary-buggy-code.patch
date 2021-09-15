@@ -1,0 +1,37 @@
+From 87adc4a1c0de1966d55d3bbd6140cc3cd9c39762 Mon Sep 17 00:00:00 2001
+From: Kazuaki Matsumura <kazuaki.matsumura@bsc.es>
+Date: Tue, 20 Oct 2020 18:39:17 +0200
+Subject: [PATCH 3/6] Remove unnecessary buggy code
+
+---
+ .../xcodeml/f/decompile/XfDecompileDomVisitor.java | 14 --------------
+ 1 file changed, 14 deletions(-)
+
+diff --git a/F-BackEnd/src/xcodeml/f/decompile/XfDecompileDomVisitor.java b/F-BackEnd/src/xcodeml/f/decompile/XfDecompileDomVisitor.java
+index d0229f84..d7cadc2c 100644
+--- a/F-BackEnd/src/xcodeml/f/decompile/XfDecompileDomVisitor.java
++++ b/F-BackEnd/src/xcodeml/f/decompile/XfDecompileDomVisitor.java
+@@ -4914,20 +4914,6 @@ XfDecompileDomVisitor {
+             NodeList clauseList = clauseListNode.getChildNodes();
+ 
+             int clauseListLength = clauseList.getLength();
+-            int directiveArgumentIndex = -1; //dummy
+-            if ( dirName.equals("WAIT")
+-                    || dirName.equals("CACHE")
+-                    || dirName.equals("ROUTINE")){
+-                //find directive argument
+-                for(int i = 0; i < clauseListLength; i++){
+-                    Node clause = clauseList.item(i);
+-                    if(getClauseName(clause).equals(dirName)){
+-                        enterClause(dirName, clause);
+-                        directiveArgumentIndex = i;
+-                        break;
+-                    }
+-                }
+-            }
+ 
+             // output clauses except for the directive argument
+             for (int i = 0; i < clauseListLength; i++){
+-- 
+2.20.1
+

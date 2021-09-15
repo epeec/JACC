@@ -6,7 +6,7 @@ Developed by Kazuaki Matsumura from the Accelerators and Communications for High
 
 ## Requirements
 * Gauche (>= 0.9.8)
-* Omni Compiler (>= 1.3.2)
+* XcodeML-tools (See tools/ for the detail)
 * PGI compiler (>= 19.4)
 
 ## Usage

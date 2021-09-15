@@ -1,0 +1,45 @@
+From a2eb3bbc0ef8be617af53802b9dec05bf76bb4cc Mon Sep 17 00:00:00 2001
+From: "K. Matsumura" <kazuaki.matsumura@bsc.es>
+Date: Mon, 14 Dec 2020 08:14:39 -0800
+Subject: [PATCH 5/6] Fix string output of Fortran
+
+---
+ F-BackEnd/src/xcodeml/f/util/XmfWriter.java | 10 +++++++++-
+ 1 file changed, 9 insertions(+), 1 deletion(-)
+
+diff --git a/F-BackEnd/src/xcodeml/f/util/XmfWriter.java b/F-BackEnd/src/xcodeml/f/util/XmfWriter.java
+index dde96adc..c420d377 100644
+--- a/F-BackEnd/src/xcodeml/f/util/XmfWriter.java
++++ b/F-BackEnd/src/xcodeml/f/util/XmfWriter.java
+@@ -171,12 +171,17 @@ public class XmfWriter
+         // Buffer capacity = <source length> * 2 + <literal prefix and suffix>
+         StringBuilder buff = new StringBuilder(s.length() * 2 + 2);
+         buff.append('"');
++        boolean escape = false;
+         for (char c : s.toCharArray()) {
+             if (c == '"') {
+-                buff.append("\"\"");
++                if (escape)
++                    buff.append("\"");
++                else
++                    buff.append("\"\"");
+             } else {
+                 buff.append(c);
+             }
++            escape = (c == '\\');
+         }
+         buff.append('"');
+         return buff.toString();
+@@ -379,6 +384,9 @@ public class XmfWriter
+                 substringLength = 1;
+             }
+ 
++            while (chArray[offset + substringLength - 1] == '\\')
++                substringLength--;
++
+             _out.write(chArray, offset, substringLength);
+             _columnNumber += substringColumnCount;
+             offset += substringLength;
+-- 
+2.20.1
+

@@ -1,0 +1,37 @@
+From 7f87a3f88bbe49204f0da6cf9723fd50353f5d22 Mon Sep 17 00:00:00 2001
+From: "K. Matsumura" <kazuaki.matsumura@bsc.es>
+Date: Mon, 14 Dec 2020 08:14:05 -0800
+Subject: [PATCH 4/6] Add ListVisitor/F
+
+---
+ .../src/xcodeml/f/decompile/XfDecompileDomVisitor.java     | 7 +++++++
+ 1 file changed, 7 insertions(+)
+
+diff --git a/F-BackEnd/src/xcodeml/f/decompile/XfDecompileDomVisitor.java b/F-BackEnd/src/xcodeml/f/decompile/XfDecompileDomVisitor.java
+index d7cadc2c..1f97a6b4 100644
+--- a/F-BackEnd/src/xcodeml/f/decompile/XfDecompileDomVisitor.java
++++ b/F-BackEnd/src/xcodeml/f/decompile/XfDecompileDomVisitor.java
+@@ -7503,6 +7503,12 @@ XfDecompileDomVisitor {
+         }
+     }
+ 
++    class ListVisitor extends XcodeNodeVisitor {
++        @Override public void enter(Node n) {
++            _invokeChildEnter(n);
++        }
++    }
++
+     abstract class ForallLikeTagVisitor extends XcodeNodeVisitor {
+ 
+         abstract public void startConstruct();
+@@ -8083,6 +8089,7 @@ XfDecompileDomVisitor {
+         new Pair("unlockStatement", new UnlockStatementVisitor()),
+         new Pair("syncStat", new SyncStatVisitor()),
+         new Pair("blockStatement", new BlockStatementVisitor()),
++        new Pair("list", new ListVisitor()),
+         new Pair("FmoduleProcedureDefinition", new FmoduleProcedureDefinitionVisitor()),
+         new Pair("forallStatement", new ForallStatementVisitor()),
+         new Pair("FwaitStatement", new FwaitStatementVisitor()),
+-- 
+2.20.1
+
